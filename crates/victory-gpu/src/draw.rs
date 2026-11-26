@@ -3524,6 +3524,95 @@ impl State {
         drawn
     }
 
+    /// [`indirect_mesh_fallback`](Self::indirect_mesh_fallback) for one
+    /// record clamped in a batch, whose pass wrote the draw's arguments
+    /// behind the dispatch's (`crate::indirect::batch::DRAW_AT`), at `at`
+    /// of `bounded` (in INDIRECT_ARGUMENT). The record's output starts its
+    /// region, so every address is known here: both executions read the
+    /// batch's buffer with plain signatures. No pass of ours, no commands
+    /// buffer, and two transitions for six. With those the card took 18 us
+    /// for each of these commands, 116 ms a frame in the world (6,364 of
+    /// them, trial v2-timing): nearly every indirect mesh dispatch of the
+    /// title is one record.
+    fn indirect_mesh_fallback_one(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        (bounded, at): (&ID3D12Resource, u64),
+    ) -> bool {
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        let regions = crate::mesh_indirect::regions(&f.layout);
+        let Ok(index_bytes) = u32::try_from(regions.index_bytes) else {
+            return false;
+        };
+        let draw = if f.expanded { host_signature(DRAW, 16) } else { host_signature(INDEXED, 20) };
+        let (Some(dispatch), Some(draw)) = (host_signature(DISPATCH, 12), draw) else {
+            return false;
+        };
+        let Some(data) = list.mesh_scratch(regions.bytes, ScratchPool::Data) else {
+            return false;
+        };
+        let buffer = &data.buffer;
+        list.keep(buffer);
+        let l = &list.list;
+        let (uav, read) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        );
+        if data.first {
+            // SAFETY: an open list and a live buffer.
+            unsafe { l.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
+        }
+        if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+            return false;
+        }
+        // SAFETY: the buffer lives until the list is reset.
+        let base = unsafe { buffer.GetGPUVirtualAddress() } + data.offset;
+        let places = [0, regions.indices, regions.prims];
+        // SAFETY: an open list with the compute pass bound; the batch's
+        // buffer is the list's.
+        unsafe {
+            for (param, place) in f.outputs.into_iter().zip(places) {
+                l.SetComputeRootUnorderedAccessView(param, base + place);
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text("indirect mesh 1 as compute".to_owned(), false));
+            l.ExecuteIndirect(&dispatch, 1, bounded, at, None, 0);
+            l.ResourceBarrier(&[transition(buffer, uav, read)]);
+        }
+        let drawn = self.prepare_for(list, false, true);
+        if drawn {
+            // SAFETY: an open list with the draw bound.
+            unsafe {
+                for (param, place) in f.inputs.into_iter().zip(places) {
+                    l.SetGraphicsRootShaderResourceView(param, base + place);
+                }
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+                if !f.expanded {
+                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                        BufferLocation: base + regions.indices,
+                        SizeInBytes: index_bytes,
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                    }));
+                }
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text("indirect mesh 1 drawn".to_owned(), false));
+                l.ExecuteIndirect(&draw, 1, bounded, at + crate::indirect::batch::DRAW_AT, None, 0);
+            }
+            self.set_topology(list, self.topology);
+        }
+        // SAFETY: an open list; the chunk is back in UNORDERED_ACCESS for the
+        // list's next draws.
+        unsafe { l.ResourceBarrier(&[transition(buffer, read, uav)]) };
+        if drawn {
+            self.drew(list, Some(p));
+        }
+        drawn
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -4202,13 +4291,16 @@ impl State {
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
     /// is, from the open batch or a new one ([`batches`]). `None` if it
-    /// cannot be clamped in one.
+    /// cannot be clamped in one. `fallback`: for a mesh dispatch drawn
+    /// without mesh shaders, what has the pass write its draw's arguments
+    /// too (`crate::indirect::batch::fallback`); else 0.
     fn batched(
         &mut self,
         list: &HostList,
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
+        fallback: u32,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -4222,7 +4314,7 @@ impl State {
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
-            && let Some(at) = b.table.place(id, offset, kind)
+            && let Some(at) = b.table.place(id, offset, kind, fallback)
         {
             return Some((b.scratch.clone(), at));
         }
@@ -4230,7 +4322,7 @@ impl State {
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let at = table.place(id, offset, kind)?;
+        let at = table.place(id, offset, kind, fallback)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4326,14 +4418,24 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One record without a count: clamped in a batch (`batches`).
+        // One record without a count: clamped in a batch (`batches`). For
+        // a mesh pipeline drawn without mesh shaders the pass writes the
+        // draw's arguments too (`indirect_mesh_fallback_one`).
+        let fallback_job = match &p.fallback {
+            Some(f) if kind == MESH => {
+                let regions = crate::mesh_indirect::regions(&f.layout);
+                crate::indirect::batch::fallback(regions.capacity, 3 * f.layout.max_primitives)
+            }
+            _ => 0,
+        };
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, &args, arguments, kind, fallback_job)
         } else {
             None
         };
-        if batch.is_some() {
+        let from_batch = batch.is_some();
+        if from_batch {
             self.window = None;
         }
         // A window of records clamped in one pass (`windows`): for single
@@ -4424,6 +4526,15 @@ impl State {
         if kind == MESH
             && let Some(f) = &p.fallback
         {
+            if from_batch {
+                let ran = self.indirect_mesh_fallback_one(list, p, f, (&bounded, at));
+                if ran {
+                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    why("mesh fallback could not run");
+                }
+                return ran;
+            }
             let (argument, uav) =
                 (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             // SAFETY: an open list; the scratch buffer is the list's.

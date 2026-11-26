@@ -37,7 +37,9 @@ ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// record's offset in the source; its place in the scratch buffer; for a
+// mesh dispatch drawn without mesh shaders the groups its output has room
+// for (bits 0-15) and the indices a group draws (16-31), else nothing.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -103,6 +105,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[1] = min(record[1], 1u);
             record[2] = min(record[2], 1u);
             cost = record[0] * record[1] * record[2] * 128u;
+        }
+        // Drawn without mesh shaders: more groups than its output holds
+        // run none (as `crate::mesh_indirect`'s pass has it).
+        if (kind > 2 && job.w != 0 && record[0] > (job.w & 0xffffu)) {
+            record[0] = 0;
+            record[1] = 0;
+            record[2] = 0;
+            cost = 0;
         }
         cost *= job.x >> 16;
     }
@@ -176,8 +186,26 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
+    // Drawn without mesh shaders: behind the dispatch's three words, the
+    // arguments of the draw of what it wrote (indices or vertices, one
+    // instance, from the first; five words serve an indexed draw).
+    if (kind > 2 && job.w != 0) {
+        uint drawn = record[0] * record[1] * record[2] * (job.w >> 16);
+        dst_args.Store4(job.z + 12, uint4(drawn, 1, 0, 0));
+        dst_args.Store(job.z + 28, 0);
+    }
 }
 "#;
+
+/// Where a mesh dispatch's draw arguments lie behind its clamped record
+/// ([`Table::place`] with `fallback`).
+pub(crate) const DRAW_AT: u64 = 12;
+
+/// A job's last word for a mesh dispatch drawn without mesh shaders: its
+/// output has room for `capacity` groups, each drawn with `indices`.
+pub(crate) fn fallback(capacity: u32, indices: u32) -> u32 {
+    capacity.min(0xffff) | indices.min(0xffff) << 16
+}
 
 /// The words of a record of `kind` (PC argument numbering).
 pub(crate) fn words(kind: u32) -> Option<u32> {
@@ -202,8 +230,8 @@ pub(crate) struct Table {
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
     times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// The job of a record (source, offset, kind, [`fallback`]).
+    known: std::collections::HashMap<(u32, u32, u32, u32), u32>,
 }
 
 impl Table {
@@ -222,12 +250,13 @@ impl Table {
     /// The place in the scratch buffer of the record of `kind` at `offset`
     /// of the host copy `id`, once the pass has run: a job of it is added if
     /// there is none. `None` if the pass cannot read that copy or has no
-    /// room for another job.
-    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+    /// room for another job. `fallback`: 0, or [`fallback`] for a mesh
+    /// dispatch whose draw arguments the pass writes too ([`DRAW_AT`]).
+    pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32, fallback: u32) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        let key = (source, offset, kind, fallback);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
@@ -250,7 +279,7 @@ impl Table {
             to.write_volatile(job(source, kind, 1));
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
-            to.add(3).write_volatile(0);
+            to.add(3).write_volatile(fallback);
             table.write_volatile(i + 1);
         }
         Some(place(i))

@@ -3004,7 +3004,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     }
                     if batched {
                         batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
-                        assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
+                        assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2, 0), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
                         assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
@@ -3036,30 +3036,30 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let mut memory = vec![0xffff_ffffu32; TABLE as usize / 4 + 1];
         // SAFETY: the vector holds the table and outlives its use.
         let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 4096, [7, 9, 0, 0]) };
-        assert_eq!(t.place(7, 64, 10), Some(4096));
-        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
-        assert_eq!(t.place(7, 64, 2), Some(4096 + 2 * u64::from(SLOT)), "another kind is another record");
+        assert_eq!(t.place(7, 64, 10, 0), Some(4096));
+        assert_eq!(t.place(9, 64, 10, 0), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 2, 0), Some(4096 + 2 * u64::from(SLOT)), "another kind is another record");
         // The same record again: the same place, charged twice.
-        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.place(9, 64, 10, 0), Some(4096 + u64::from(SLOT)));
         assert_eq!(&memory[..4], [3, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
         assert_eq!(memory[4..8], [job(0, 10, 1), 64, 4096, 0]);
         assert_eq!(memory[8..12], [job(1, 10, 2), 64, 4096 + SLOT, 0]);
         assert_eq!(job(1, 10, 2), 1 | 10 << 4 | 3 << 8 | 2 << 16);
         // Not a copy of the pass, not on 4 bytes, past 32 bits, not a kind.
         for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 3)] {
-            assert_eq!(t.place(id, offset, kind), None);
+            assert_eq!(t.place(id, offset, kind, 0), None);
         }
         // Read more often than one job may be charged for: another job.
         for _ in 1..TIMES {
-            assert_eq!(t.place(7, 64, 10), Some(4096));
+            assert_eq!(t.place(7, 64, 10, 0), Some(4096));
         }
-        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
-        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 10, 0), Some(4096 + 3 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 10, 0), Some(4096 + 3 * u64::from(SLOT)));
         for i in 4..u64::from(JOBS) {
-            assert_eq!(t.place(7, 1024 + 16 * i, 0), Some(4096 + i * u64::from(SLOT)));
+            assert_eq!(t.place(7, 1024 + 16 * i, 0, 0), Some(4096 + i * u64::from(SLOT)));
         }
-        assert_eq!(t.place(7, 1024, 1), None, "full");
-        assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 1024, 1, 0), None, "full");
+        assert_eq!(t.place(7, 1024 + 16 * 5, 0, 0), Some(4096 + 5 * u64::from(SLOT)));
         assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
     }
 
@@ -3116,7 +3116,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
                     // SAFETY: the mapped table; the list has not run.
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
-                    assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
+                    assert_eq!(table.place(1 + i as u64 % 2, offset, *kind, 0), Some(0));
                 } else {
                     assert!(record_clamp_as(
                         &warp.clamp,
@@ -3143,6 +3143,57 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             // (A mesh record that asks for nothing notes nothing.)
             assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?}", records[i].1);
         }
+    }
+
+    /// A mesh dispatch drawn without mesh shaders gets its draw's arguments
+    /// behind its clamped record: the indices of the groups it runs, and
+    /// none of either when its output has no room for them.
+    #[test]
+    fn warp_batch_writes_a_fallback_draws_arguments() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(1024);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(64 << 10);
+        // Groups asked for; the output holds 100, 384 indices a group.
+        let asked = [5u32, 100, 101, 0, 70_000];
+        batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+        // SAFETY: mapped buffers, which the list has not read yet.
+        let mut table = unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for (r, g) in asked.into_iter().enumerate() {
+                for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(r * 3 + w).write_volatile(word);
+                }
+            }
+            batch::Table::new(table_ptr, 0, [1, 0, 0, 0])
+        };
+        for r in 0..asked.len() as u64 {
+            assert_eq!(table.place(1, r * 12, 10, batch::fallback(100, 384)), Some(r * u64::from(batch::SLOT)));
+        }
+        // The same record for a real mesh dispatch is a job of its own, as before.
+        assert_eq!(table.place(1, 0, 10, 0), Some(asked.len() as u64 * u64::from(batch::SLOT)));
+        // SAFETY: an open list; the records are readable as arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped words.
+        let slot = |r: usize| -> Vec<u32> {
+            (0..8).map(|w| unsafe { back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4 + w).read_volatile() }).collect()
+        };
+        assert_eq!(batch::DRAW_AT, 12);
+        assert_eq!(slot(0), [5, 1, 1, 5 * 384, 1, 0, 0, 0]);
+        assert_eq!(slot(1), [100, 1, 1, 100 * 384, 1, 0, 0, 0]);
+        assert_eq!(slot(2), [0, 0, 0, 0, 1, 0, 0, 0], "more groups than the output holds");
+        assert_eq!(slot(3), [0, 1, 1, 0, 1, 0, 0, 0]);
+        assert_eq!(slot(4), [0, 0, 0, 0, 1, 0, 0, 0], "more groups than a dispatch takes");
+        assert_eq!(slot(5)[..3], [5, 1, 1]);
     }
 
     /// Records past the list's budget come out empty, and one read by many
@@ -3174,7 +3225,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             for _ in 0..times {
                 for r in 0..records {
-                    assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
+                    assert_eq!(table.place(1, r * 16, 0, 0), Some(r * u64::from(batch::SLOT)));
                 }
             }
             // SAFETY: an open list; the records are readable as arguments.
@@ -3246,7 +3297,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                 }
                 for (id, record) in [(1u64, 3 + k % 4), (2, 5), (1, 0), (2, 5)] {
-                    let at = table.place(id, u64::from(record) * 32, 2).unwrap();
+                    let at = table.place(id, u64::from(record) * 32, 2, 0).unwrap();
                     // SAFETY: as above.
                     unsafe { list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0) };
                     expected += record + if id == 1 { 1 } else { 100 };
@@ -3299,7 +3350,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
                     }
                     state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-                    let at = if run == 0 { 0 } else { table.place(1, u64::from(i % 2048) * 32, 2).unwrap() };
+                    let at = if run == 0 { 0 } else { table.place(1, u64::from(i % 2048) * 32, 2, 0).unwrap() };
                     // SAFETY: an open list; live buffers.
                     unsafe {
                         if run == 0 || i % run == 0 {
