@@ -399,42 +399,76 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         );
         return UNKNOWN_TYPE;
     }
+    if context.is_null() {
+        return PARAMETER;
+    }
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
-    let list = dispatch.list.cast::<Object>().cast_const();
-    // Alive for the call (the list holds them too).
-    let mut textures = Vec::new();
-    for r in dispatch
-        .resources
-        .iter_mut()
-        .filter(|r| !r.resource.is_null())
-    {
-        let wanted = host_state(r.state);
-        let texture = wanted.and_then(|w| {
-            victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
-                .filter(|&(_, state)| state == w)
-        });
-        let Some((texture, _)) = texture else {
-            once!(
-                warn,
-                state = r.state,
-                "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
-            );
-            return PARAMETER;
-        };
-        r.resource = texture.as_raw();
-        textures.push(texture);
+    // The work may be recorded after the call (the list's calls written
+    // down, `VICTORY_THIN`), when the title's further descriptions are gone.
+    if !dispatch.header.next.is_null() {
+        once!(info, "FidelityFX: an upscaling's further descriptions are left out");
+        dispatch.header.next = null_mut();
     }
-    once!(info, formats = ?textures.iter().map(|t| {
-        // SAFETY: a live texture.
-        unsafe { t.GetDesc() }.Format.0
-    }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
-        dispatch.list = host_list.as_raw();
-        // SAFETY: the PC dispatch on host objects; the context is the host's.
-        unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
-    })
-    .unwrap_or(PARAMETER)
+    let list = dispatch.list.cast::<Object>().cast_const();
+    let work = Upscaling {
+        dispatch,
+        // SAFETY: the title passes its context.
+        context: unsafe { *context },
+    };
+    victory_gpu::external::in_order(list, move |list| work.run(host, list));
+    OK
+}
+
+/// An upscaling, recorded where the title's list gets to it.
+struct Upscaling {
+    dispatch: DispatchUpscale,
+    context: *mut c_void,
+}
+
+// SAFETY: plain values, and the title's objects, which live until its list
+// has run; the context is the host DLL's.
+unsafe impl Send for Upscaling {}
+
+impl Upscaling {
+    fn run(mut self, host: &Host, list: *const Object) {
+        // Alive for the call (the list holds them too).
+        let mut textures = Vec::new();
+        for r in self
+            .dispatch
+            .resources
+            .iter_mut()
+            .filter(|r| !r.resource.is_null())
+        {
+            let wanted = host_state(r.state);
+            let texture = wanted.and_then(|w| {
+                victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
+                    .filter(|&(_, state)| state == w)
+            });
+            let Some((texture, _)) = texture else {
+                once!(
+                    warn,
+                    state = r.state,
+                    "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
+                );
+                return;
+            };
+            r.resource = texture.as_raw();
+            textures.push(texture);
+        }
+        once!(info, formats = ?textures.iter().map(|t| {
+            // SAFETY: a live texture.
+            unsafe { t.GetDesc() }.Format.0
+        }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
+        let code = victory_gpu::external::record(list, |host_list| {
+            self.dispatch.list = host_list.as_raw();
+            // SAFETY: the PC dispatch on host objects; the context is the host's.
+            unsafe { (host.dispatch)(&mut self.context, &raw mut self.dispatch.header) }
+        });
+        if code != Some(OK) {
+            once!(warn, code = ?code, "FidelityFX: the host's upscaling failed");
+        }
+    }
 }
 
 pub(crate) fn module() -> HleModule {

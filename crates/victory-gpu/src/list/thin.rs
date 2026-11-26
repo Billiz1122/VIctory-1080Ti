@@ -469,6 +469,24 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const EXTERNAL: u64 = after(17);
+
+/// What a host library records into a title list (`crate::external`), done
+/// on the list of ours when the stream gets there.
+type External = Box<dyn FnOnce(This) + Send>;
+
+/// Writes `f` into the stream of the title list `this`; false if that list is
+/// not being written down (not begun, or closed).
+/// shortcut: a stream the title lets go of before it is translated drops its
+/// `f` unrun and unfreed (a few words, rare); free them in `Recording`'s drop if it shows.
+pub(crate) fn external(this: This, f: External) -> bool {
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return false;
+    }
+    front.put(EXTERNAL, &[Box::into_raw(Box::new(f)) as u64]);
+    true
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -697,6 +715,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if op == EXTERNAL {
+            // SAFETY: made by `external`, named once.
+            let f = *unsafe { Box::from_raw(w[0] as *mut External) };
+            if !skip {
+                f(list);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

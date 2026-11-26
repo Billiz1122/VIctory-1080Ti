@@ -2442,16 +2442,43 @@ impl Pool {
         Some(region)
     }
 
-    // shortcut: the list keeps its chunks. Handing them from list to list
-    // or letting them go here lost the device within seconds in four runs
-    // of five (invalid call, the debug layer silent: 2026-11-26); what a
-    // list may hold is bounded by `MESH_POOL_BUDGET` instead.
-    fn reset(&mut self) {
-        for (_, _, used, touched) in &mut self.chunks {
-            (*used, *touched) = (0, false);
+}
+
+/// A mesh fallback chunk no list holds.
+struct MeshChunk(ID3D12Resource);
+
+// SAFETY: a D3D12 resource (free-threaded), used by one list at a time.
+unsafe impl Send for MeshChunk {}
+
+/// Mesh fallback chunks no list holds, by size: a list gives its chunks back
+/// at its reset, when every submission of it has run (so they decayed to
+/// COMMON, which [`ScratchRegion::first`] then says), and the next list that
+/// needs a chunk of that size takes one. Kept by their list instead, the
+/// 2,000 host lists alive in the world (idle ones included) held 3 to 4 GB
+/// of an 11 GB card, which went 40 % past its budget and the card's time
+/// with it (2026-11-26). (Handing chunks on lost the device once, but that
+/// was before the barycentric and 64-lane pipelines that lost it anyway
+/// were refused.)
+static MESH_SPARE: Mutex<Spare<MeshChunk>> = Mutex::new(Spare::new());
+/// The most bytes of [`MESH_SPARE`]; the rest are let go.
+const MESH_SPARE_MOST: u64 = 256 << 20;
+
+/// A kept mesh fallback chunk of `size` bytes ([`MESH_SPARE`]), if any.
+fn take_mesh_chunk(size: u64) -> Option<ID3D12Resource> {
+    MESH_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size).map(|MeshChunk(buffer)| buffer)
+}
+
+/// A list is done with its mesh fallback chunks (see [`MESH_SPARE`]).
+fn give_mesh_chunks(chunks: impl IntoIterator<Item = (ID3D12Resource, u64)>) {
+    let mut freed = Vec::new();
+    {
+        let mut spare = MESH_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in chunks {
+            freed.extend(spare.give(MeshChunk(buffer), size, MESH_SPARE_MOST));
         }
-        self.current = 0;
     }
+    // Freed outside the lock.
+    drop(freed);
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -6700,12 +6727,9 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        self.mesh_scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pools
-            .iter_mut()
-            .for_each(Pool::reset);
+        // Its mesh fallback chunks go back for any list ([`MESH_SPARE`]).
+        let pools = std::mem::take(&mut self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner()).pools);
+        give_mesh_chunks(pools.into_iter().flat_map(|p| p.chunks).map(|(buffer, size, ..)| (buffer, size)));
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7383,6 +7407,9 @@ impl HostList {
     pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ScratchRegion> {
         let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
         s.pools[pool as usize].region(len, |size| {
+            if let Some(buffer) = take_mesh_chunk(size) {
+                return Some(buffer);
+            }
             let buffer = host()?.uav_buffer(size)?;
             name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
             Some(buffer)
@@ -11369,12 +11396,14 @@ mod mesh_scratch {
         assert!(!same(&a, &big));
         let after = region(&mut pool, 10);
         assert_eq!((after.offset, after.first), (100 << 20, false));
-        // After a reset the first chunk serves again, from COMMON.
-        pool.reset();
-        let again = region(&mut pool, 10);
+        assert_eq!(made, [MESH_CHUNK_FIRST, 128 << 20]);
+        // At the list's reset its chunks go back, and the next list's first
+        // region of that size takes one of them, from COMMON.
+        super::give_mesh_chunks(std::mem::take(&mut pool.chunks).into_iter().map(|(b, s, ..)| (b, s)));
+        let mut next = Pool::default();
+        let again = next.region(10, super::take_mesh_chunk).unwrap();
         assert_eq!((again.offset, again.first), (0, true));
         assert!(same(&a, &again));
-        assert_eq!(made, [MESH_CHUNK_FIRST, 128 << 20]);
     }
 
     #[test]

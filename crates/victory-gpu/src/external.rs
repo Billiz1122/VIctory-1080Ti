@@ -31,6 +31,22 @@ pub fn host_texture(
     Some((texture, state))
 }
 
+/// Runs `f` with the list that records the commands of the title list `list`
+/// (open for recording), in order with them: `list` itself, now; or, while
+/// list calls are written down and translated by threads of ours
+/// (`VICTORY_THIN`), the list of ours they go to, when the translation gets
+/// to this place. So `f` takes with it what it reads of the title's
+/// arguments, and finds the host list with [`host_texture`] and [`record`]
+/// on the list it is given.
+pub fn in_order(list: *const Object, f: impl FnOnce(*const Object) + Send + 'static) {
+    if crate::list::thin::on() {
+        // (A list not being written down, closed or not begun, records nothing.)
+        let _ = crate::list::thin::external(list, Box::new(f));
+        return;
+    }
+    f(list)
+}
+
 /// Runs `f` with the host list behind the title list `list` (open for
 /// recording); `None` without one. What `f` binds (descriptor heaps, root
 /// signatures, pipeline) is replaced before the list's next draw or
