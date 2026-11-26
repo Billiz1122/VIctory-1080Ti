@@ -1285,6 +1285,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shader-writable memory for what mesh programs run as compute write
+    /// (see [`HostList::mesh_scratch`]), reused after a reset.
+    mesh_scratch: Mutex<MeshScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -2336,6 +2339,119 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+}
+
+/// Default-heap memory a list's mesh fallback draws write and read: per
+/// [`ScratchPool`], chunks handed out in order, each draw getting a region
+/// of its own (see [`HostList::mesh_scratch`]).
+#[derive(Default)]
+struct MeshScratch {
+    pools: [Pool; 2],
+}
+
+/// Which memory a mesh fallback draw asks for: what the mesh program writes,
+/// or the commands an indirect draw executes. Kept apart because a draw
+/// moves the chunks it uses between states, and an indirect draw reads its
+/// commands (indirect arguments) while it writes its data (UAV).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScratchPool {
+    Data = 0,
+    Commands = 1,
+}
+
+/// Chunks (buffer, size, bytes used since the reset, used as a UAV since the
+/// reset) and the chunk being filled.
+#[derive(Default)]
+struct Pool {
+    chunks: Vec<(ID3D12Resource, u64, u64, bool)>,
+    current: usize,
+}
+
+/// A list's first mesh fallback chunk: small, since every list that makes
+/// one fallback draw keeps its chunks, and a frame has dozens of lists (with
+/// 64 MiB each from the start, an 8 GB card ran out of memory, #961).
+const MESH_CHUNK_FIRST: u64 = 1 << 20;
+/// Each further chunk of a list doubles, up to this; bigger regions get a
+/// chunk of their own (a power of two, kept for later draws).
+const MESH_CHUNK: u64 = 64 << 20;
+/// What a list's pool may hold before it reuses its chunks from the start
+/// rather than make more. Reuse is safe because each fallback draw ends
+/// with its chunks moved from read back to UNORDERED_ACCESS, which waits
+/// for the draw's reads before any later write; without it, a list of many
+/// indirect mesh draws (each reserving its worst case) ran an 8 GB card out
+/// of memory (#961). 4 MiB, the worst case of one indirect draw
+/// (`crate::mesh_indirect::BYTES`): at 64 MiB the 900 lists alive in the
+/// world held 15 GB between them and an 11 GB card ran out (2026-11-26).
+const MESH_POOL_BUDGET: u64 = 4 << 20;
+
+/// A region of a list's mesh fallback memory.
+pub(crate) struct ScratchRegion {
+    pub(crate) buffer: ID3D12Resource,
+    /// Byte offset of the region in `buffer`.
+    pub(crate) offset: u64,
+    /// The list uses `buffer` for the first time since its reset: it is in
+    /// COMMON (new, or decayed after the list last ran) and must move to
+    /// UNORDERED_ACCESS first. Otherwise it is in UNORDERED_ACCESS.
+    pub(crate) first: bool,
+}
+
+impl Pool {
+    /// A region of at least `len` bytes; `make` makes a chunk of a size.
+    fn region(
+        &mut self,
+        len: u64,
+        make: impl FnOnce(u64) -> Option<ID3D12Resource>,
+    ) -> Option<ScratchRegion> {
+        let len = len.max(16).next_multiple_of(256);
+        // The chunk being filled, else the next one big enough (chunks past
+        // the current one are unused since the reset), else a new one.
+        let mut at = self.current;
+        while at < self.chunks.len() {
+            let (_, size, used, _) = &self.chunks[at];
+            if used + len <= *size {
+                break;
+            }
+            at += 1;
+        }
+        if at == self.chunks.len() {
+            let doubled = MESH_CHUNK_FIRST << self.chunks.len().min(16);
+            let size = doubled.min(MESH_CHUNK).max(len.next_power_of_two());
+            let held: u64 = self.chunks.iter().map(|c| c.1).sum();
+            let fits = self.chunks.iter().position(|c| len <= c.1);
+            match fits {
+                // Over the budget: start again in the first chunk that holds
+                // it (its earlier regions are done with, see the budget).
+                Some(first) if held + size > MESH_POOL_BUDGET => {
+                    for (_, _, used, _) in &mut self.chunks {
+                        *used = 0;
+                    }
+                    at = first;
+                }
+                _ => self.chunks.push((make(size)?, size, 0, false)),
+            }
+        }
+        self.current = at;
+        let (buffer, _, used, touched) = &mut self.chunks[at];
+        let region = ScratchRegion {
+            buffer: buffer.clone(),
+            offset: *used,
+            first: !*touched,
+        };
+        *used += len;
+        *touched = true;
+        Some(region)
+    }
+
+    // shortcut: the list keeps its chunks. Handing them from list to list
+    // or letting them go here lost the device within seconds in four runs
+    // of five (invalid call, the debug layer silent: 2026-11-26); what a
+    // list may hold is bounded by `MESH_POOL_BUDGET` instead.
+    fn reset(&mut self) {
+        for (_, _, used, touched) in &mut self.chunks {
+            (*used, *touched) = (0, false);
+        }
+        self.current = 0;
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4113,6 +4229,25 @@ fn hand_back(back: &[Declared]) {
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
+    /// Whether pixel shaders may read barycentrics (`SV_Barycentrics`).
+    pub(crate) fn barycentrics(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a plain query into a structure of its own size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            let on = asked.is_ok() && options.BarycentricsSupported.as_bool();
+            tracing::info!(on, "host barycentrics");
+            on
+        })
+    }
+
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
@@ -4256,6 +4391,7 @@ impl Host {
                 list: rec::Rec::new(list),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -5307,6 +5443,22 @@ impl Host {
             crate::copystat::compared(from, to - from, written);
             let _ = (from, to);
         }
+    }
+
+    /// Whether mesh pipelines run their mesh program as compute and draw
+    /// what it wrote with a vertex shader (issue #3): on hosts without mesh
+    /// shaders, or everywhere with `VICTORY_MESH_FALLBACK=1` (to compare).
+    pub(crate) fn mesh_fallback(&self) -> bool {
+        static FALLBACK: OnceLock<bool> = OnceLock::new();
+        *FALLBACK.get_or_init(|| {
+            let value = std::env::var("VICTORY_MESH_FALLBACK");
+            let forced = value.as_deref().is_ok_and(|v| v == "1");
+            // `VICTORY_MESH_FALLBACK=0`: never (mesh pipelines refused without mesh shaders).
+            let off = value.as_deref().is_ok_and(|v| v == "0");
+            let fallback = !off && (forced || !self.mesh_shaders());
+            tracing::info!(fallback, forced, "mesh programs run as compute");
+            fallback
+        })
     }
 
     /// Runs closed lists and waits for them, and with [`late`] for
@@ -6548,6 +6700,12 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        self.mesh_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .iter_mut()
+            .for_each(Pool::reset);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7210,6 +7368,25 @@ impl HostList {
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         scratch.chunks.iter().map(|c| c.1).sum()
+    }
+
+    /// A region of at least `len` bytes (256-byte aligned) of the list's
+    /// shader-writable mesh fallback memory in `pool`, for one draw, which no
+    /// other draw of the list gets until the list is reset.
+    ///
+    /// The chunks of a pool stay in UNORDERED_ACCESS between draws: the
+    /// draw moves its chunk out of it for its reads and back after them
+    /// (first from COMMON, when [`ScratchRegion::first`]). A chunk's
+    /// transitions cover the whole chunk; regions of earlier draws are only
+    /// read by those draws, which the transitions order before later writes.
+    /// After the list runs the chunks decay to COMMON, as buffers do.
+    pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ScratchRegion> {
+        let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.pools[pool as usize].region(len, |size| {
+            let buffer = host()?.uav_buffer(size)?;
+            name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
+            Some(buffer)
+        })
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -10141,8 +10318,54 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// The client size of our own window for a picture of `width` x `height`:
+/// shrunk, proportions kept, to fit the work area and `VICTORY_WINDOW_MAX`
+/// (`WxH`), as the title's own window is fitted (`victory-hle`'s
+/// lifecycle). Ours is used when the title's window is not visible, as
+/// when the program is started hidden.
+fn our_window_size(width: u32, height: u32) -> (u32, u32) {
+    let mut area = RECT::default();
+    // SAFETY: `area` receives the primary monitor's work area.
+    let known = unsafe {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, Some((&raw mut area).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+    }
+    .is_ok();
+    let mut bound = known.then(|| ((area.right - area.left).max(1) as u32, (area.bottom - area.top).max(1) as u32));
+    let limit = std::env::var("VICTORY_WINDOW_MAX").ok().and_then(|v| {
+        let (w, h) = v.trim().split_once(['x', 'X'])?;
+        let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+        (w > 0 && h > 0).then_some((w, h))
+    });
+    if let Some((w, h)) = limit {
+        bound = Some(bound.map_or((w, h), |(a, b)| (a.min(w), b.min(h))));
+    }
+    fit_size((width, height), bound)
+}
+
+/// `size` scaled down, proportions kept, to fit `bound` (unchanged if it
+/// fits, or without a bound).
+fn fit_size((width, height): (u32, u32), bound: Option<(u32, u32)>) -> (u32, u32) {
+    let Some((bw, bh)) = bound else {
+        return (width, height);
+    };
+    if width == 0 || height == 0 || (width <= bw && height <= bh) {
+        return (width, height);
+    }
+    let scale = f64::min(f64::from(bw) / f64::from(width), f64::from(bh) / f64::from(height));
+    ((f64::from(width) * scale) as u32, (f64::from(height) * scale) as u32)
+}
+
+#[test]
+fn our_window_keeps_its_proportions_inside_the_bound() {
+    assert_eq!(fit_size((3840, 2160), Some((640, 360))), (640, 360));
+    assert_eq!(fit_size((3840, 2160), Some((1920, 1040))), (1848, 1040));
+    assert_eq!(fit_size((640, 360), Some((1920, 1040))), (640, 360));
+    assert_eq!(fit_size((3840, 2160), None), (3840, 2160));
+}
+
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    let (width, height) = our_window_size(width, height);
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -11072,3 +11295,154 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+#[cfg(test)]
+mod mesh_scratch {
+    use super::{MESH_CHUNK, MESH_CHUNK_FIRST, MESH_POOL_BUDGET, Pool};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// A small buffer standing for a chunk (the pool only keeps it).
+    fn buffer(device: &ID3D12Device) -> ID3D12Resource {
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: a plain buffer creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+        }
+        r.unwrap()
+    }
+
+    #[test]
+    fn draws_get_their_own_regions_and_chunks_come_back_after_a_reset() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        let mut region = |pool: &mut Pool, len| {
+            pool.region(len, |size| {
+                made.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap()
+        };
+        let same = |a: &super::ScratchRegion, b: &super::ScratchRegion| {
+            a.buffer.as_raw() == b.buffer.as_raw()
+        };
+        let a = region(&mut pool, 1000);
+        let b = region(&mut pool, 300);
+        assert_eq!((a.offset, a.first), (0, true));
+        // 256-byte aligned after the first; the chunk is already a UAV.
+        assert_eq!((b.offset, b.first), (1024, false));
+        assert!(same(&a, &b));
+        // Bigger than a chunk: one of its own, a power of two.
+        let big = region(&mut pool, 100 << 20);
+        assert_eq!((big.offset, big.first), (0, true));
+        assert!(!same(&a, &big));
+        let after = region(&mut pool, 10);
+        assert_eq!((after.offset, after.first), (100 << 20, false));
+        // After a reset the first chunk serves again, from COMMON.
+        pool.reset();
+        let again = region(&mut pool, 10);
+        assert_eq!((again.offset, again.first), (0, true));
+        assert!(same(&a, &again));
+        assert_eq!(made, [MESH_CHUNK_FIRST, 128 << 20]);
+    }
+
+    #[test]
+    fn a_list_starts_small_and_its_chunks_double_up_to_the_cap() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        // Regions of 768 KiB: one per chunk until the chunks hold more.
+        for _ in 0..12 {
+            pool.region(768 << 10, |size| {
+                made.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap();
+        }
+        // 1 + 2 MiB; a third chunk would pass the budget, so these two
+        // come round again.
+        assert_eq!(made, [MESH_CHUNK_FIRST, 2 << 20]);
+        assert!(made.iter().all(|&s| s <= MESH_CHUNK));
+        // A list with one small draw keeps 1 MiB, not 64.
+        let mut small = Pool::default();
+        let mut one = Vec::new();
+        small
+            .region(4096, |size| {
+                one.push(size);
+                Some(buffer(&device))
+            })
+            .unwrap();
+        assert_eq!(one, [MESH_CHUNK_FIRST]);
+    }
+
+    #[test]
+    fn past_its_budget_a_list_reuses_its_chunks_from_the_start() {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: a plain device creation with a valid out pointer.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let device = device.unwrap();
+        let mut made = Vec::new();
+        let mut pool = Pool::default();
+        // Indirect draws reserving their worst case each (the budget's
+        // worth), many of them in one list.
+        let mut offsets = Vec::new();
+        for _ in 0..40 {
+            let r = pool
+                .region(MESH_POOL_BUDGET, |size| {
+                    made.push(size);
+                    Some(buffer(&device))
+                })
+                .unwrap();
+            offsets.push(r.offset);
+        }
+        let held: u64 = made.iter().sum();
+        assert!(held <= MESH_POOL_BUDGET, "{made:?}");
+        // The regions came round again: the first offset recurs.
+        assert!(offsets.iter().skip(1).any(|&o| o == offsets[0]));
+        // A reused chunk is no longer `first`: it stays a UAV.
+        let r = pool
+            .region(MESH_POOL_BUDGET, |_| panic!("no new chunk past the budget"))
+            .unwrap();
+        assert!(!r.first);
+    }
+}

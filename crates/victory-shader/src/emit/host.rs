@@ -262,25 +262,26 @@ impl Host {
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
-                        RegisterSpace: super::USER_DATA_SPACE,
+                        RegisterSpace: super::USER_DATA_SPACE + s.space_shift(),
                         Num32BitValues: s.user_data_dwords().max(1),
                     },
                 },
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
-        let mut views: Vec<(u8, u8)> = stages
+        // By space shift, slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        let mut views: Vec<(u32, u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
-                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+                let shift = s.space_shift();
+                let cbvs = s.root_cbvs.iter().map(move |&r| (shift, r, 0));
+                let srvs = s.root_srvs.iter().map(move |&r| (shift, r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(move |&r| (shift, r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, kind) in views {
+        for (shift, slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -290,7 +291,7 @@ impl Host {
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        RegisterSpace: super::ROOT_CBV_SPACE + shift,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -325,7 +326,7 @@ impl Host {
                     MinLOD: d.min_lod,
                     MaxLOD: d.max_lod,
                     ShaderRegister: n as u32,
-                    RegisterSpace: super::SAMPLER_SPACE,
+                    RegisterSpace: super::SAMPLER_SPACE + s.space_shift(),
                     ShaderVisibility: vis,
                 });
             }

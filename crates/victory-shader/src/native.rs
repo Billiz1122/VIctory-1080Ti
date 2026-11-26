@@ -70,7 +70,7 @@
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{u32_at, u64_at};
+use crate::dxbc::{u16_at, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -572,12 +572,6 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }),
         code: code.to_vec(),
     })
-}
-
-fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
-    data.get(at..at + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .ok_or(Malformed("FSPX data out of bounds"))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -1270,5 +1264,158 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    /// A metadata record of a resource the code reads.
+    fn fspx_resource(
+        kind: u8,
+        root: u8,
+        table_offset: u32,
+        register: u32,
+        user_data: u8,
+        slot: u8,
+    ) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, root]);
+        r[8..12].copy_from_slice(&table_offset.to_le_bytes());
+        r[12..16].copy_from_slice(&register.to_le_bytes());
+        r[16] = 1;
+        r[20..23].copy_from_slice(&[4, user_data, slot]);
+        r[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        r
+    }
+
+    /// An `ACCC` part's data in the observed layout: `code` as a compute
+    /// program with 16 VGPRs, `rsrc2` and `threads`, and `records`.
+    fn fspx(
+        code: &[u8],
+        rsrc2: u32,
+        threads: [u16; 3],
+        wave32: bool,
+        records: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let flags = if wave32 { PACKET_WAVE32 } else { 0 };
+        let packet = words(&[
+            0,
+            0,
+            0,
+            u32::from(threads[0]) | u32::from(threads[1]) << 16,
+            u32::from(threads[2]) | u32::from(flags) << 16,
+            // 16 VGPRs either way: 2 granules of 8, or 4 of 4.
+            if wave32 { 1 } else { 3 },
+            rsrc2,
+        ]);
+        let hash = {
+            let mut r = [0u8; 32];
+            r[0] = 0x43;
+            r
+        };
+        let mut meta = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        let resources = records.iter().filter(|r| r[0] == 0x41).count() as u8;
+        meta.extend_from_slice(&[0x40, 4, resources, 0]);
+        records
+            .iter()
+            .chain([&hash])
+            .for_each(|r| meta.extend_from_slice(r));
+        let len = meta.len() as u32 - 0x14;
+        meta[4..8].copy_from_slice(&len.to_le_bytes());
+        let blobs: [(u32, &[u8]); 4] = [
+            (FSPX_PACKET, &packet),
+            (1, &[0; 0x14]),
+            (FSPX_CODE, code),
+            (FSPX_METADATA, &meta),
+        ];
+        let mut out = vec![0u8; FSPX_HEADER + 16 * blobs.len()];
+        for (i, (kind, blob)) in blobs.iter().enumerate() {
+            let at = out.len().next_multiple_of(16);
+            out.resize(at, 0);
+            let entry = words(&[*kind, at as u32, blob.len() as u32, 0]);
+            out[FSPX_HEADER + 16 * i..FSPX_HEADER + 16 * (i + 1)].copy_from_slice(&entry);
+            out.extend_from_slice(blob);
+        }
+        let header = words(&[
+            u32::from_le_bytes(*b"FSPX"),
+            FSPX_VERSION,
+            4,
+            out.len() as u32,
+        ]);
+        out[..16].copy_from_slice(&header);
+        out
+    }
+
+    #[test]
+    fn reads_fspx_compute_programs() {
+        let code = [0x00, 0x00, 0x81, 0xBF]; // s_endpgm
+        let records = [
+            fspx_resource(3, 3, 0x58, 11, 4, 0),
+            fspx_resource(2, 1, 0, 0, 6, 2),
+            // An immediate sampler: its words are in the code.
+            fspx_resource(1, 4, 0, 0, 0, 0),
+            [0x42; 32],
+        ];
+        let data = fspx(&code, 0x9c, [32, 1, 1], true, &records);
+        let p = &native_programs(&data).unwrap()[0];
+        assert_eq!((p.stage, p.wave64, p.vgprs), (HwStage::Cs, false, 16));
+        assert_eq!(p.code, code);
+        assert_eq!(
+            p.io,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0x9c,
+                threads: [32, 1, 1]
+            })
+        );
+        let roots: Vec<_> = p
+            .layout
+            .iter()
+            .map(|r| (r.root, r.sgprs, r.user_data, r.slot))
+            .collect();
+        assert_eq!(
+            roots,
+            [(RootType::Table, 1, 4, 0), (RootType::Descriptor, 2, 6, 2)]
+        );
+        assert_eq!(p.used.len(), 3);
+        let uav = p.used[0];
+        assert_eq!(
+            (
+                uav.kind,
+                uav.table_offset_dwords,
+                uav.lower_bound,
+                uav.dwords
+            ),
+            (ResourceType::Uav, 0x58, 11, 4)
+        );
+        assert_eq!(p.used[2].root, RootType::ImmediateSampler);
+        let wave64 = fspx(&code, 0, [64, 1, 1], false, &[]);
+        assert!(native_programs(&wave64).unwrap()[0].wave64);
+    }
+
+    #[test]
+    fn rejects_corrupt_fspx_parts() {
+        let code = [0x00, 0x00, 0x81, 0xBF];
+        let good = fspx(&code, 0, [64, 1, 1], false, &[]);
+        let corrupt = |at: usize, byte: u8| {
+            let mut data = good.clone();
+            data[at] = byte;
+            native_programs(&data)
+        };
+        assert!(corrupt(4, 2).is_err(), "unknown version");
+        assert!(corrupt(8, 0xFF).is_err(), "entry count");
+        // The code entry's size no longer matches the metadata's count.
+        assert!(corrupt(FSPX_HEADER + 32 + 8, 8).is_err(), "code size");
+        let mut root_constants = fspx(
+            &code,
+            0,
+            [64, 1, 1],
+            false,
+            &[fspx_resource(2, 0, 0, 0, 4, 0)],
+        );
+        assert!(
+            native_programs(&root_constants).is_err(),
+            "unknown root type"
+        );
+        root_constants.truncate(40);
+        assert!(native_programs(&root_constants).is_err(), "truncated");
     }
 }

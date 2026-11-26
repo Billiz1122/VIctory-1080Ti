@@ -129,6 +129,7 @@ fn lowered_counted(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
     }, counted);
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;

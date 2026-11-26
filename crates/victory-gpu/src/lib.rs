@@ -39,6 +39,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -57,6 +59,7 @@ mod port_cbv;
 pub mod port_descriptors;
 #[cfg(windows)]
 mod land;
+mod mesh_indirect;
 pub mod list;
 pub mod object;
 pub mod pipeline;

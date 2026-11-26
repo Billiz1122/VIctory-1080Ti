@@ -91,6 +91,9 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod mesh_compute_tests;
+mod mesh_vs;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -121,10 +124,34 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MESH_COMPUTE_SPACES, MESH_OUT_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// The wave size a translated shader requires (its `WaveSize`, as its
+/// `PSV0` part states it), if it requires one.
+pub fn required_wave(dxil: &[u8]) -> Option<u32> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    // A u32 size, then the runtime info: its minimum wave lanes at +16.
+    let min = u32::from_le_bytes(psv.get(20..24)?.try_into().ok()?);
+    (min > 0).then_some(min)
+}
+
+/// The `SFI0` features of a translated shader (`D3D_SHADER_REQUIRES_*`
+/// bits, e.g. 0x2_0000 barycentrics); 0 without the part.
+pub fn required_features(dxil: &[u8]) -> u64 {
+    Container::parse(dxil)
+        .ok()
+        .and_then(|c| Some(u64::from_le_bytes(c.part(FourCC::SFI0)?.data.try_into().ok()?)))
+        .unwrap_or(0)
+}
+
+/// The most lanes a wave of the host has ([`set_host_max_wave`]).
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -368,6 +395,24 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// How far its user data, root views and immediate samplers are moved
+    /// from [`USER_DATA_SPACE`], [`ROOT_CBV_SPACE`] and [`SAMPLER_SPACE`]:
+    /// [`MESH_COMPUTE_SPACES`] for a mesh program lowered as compute (a
+    /// [`MeshFallback`]'s `compute`), 0 for any other shader.
+    pub fn space_shift(&self) -> u32 {
+        let compute = || -> Option<bool> {
+            let c = Container::parse(&self.dxil).ok()?;
+            let word = c.part(FourCC::DXIL)?.data.get(0..4)?;
+            // The program version word: kind 5 is compute.
+            Some(u32::from_le_bytes(word.try_into().ok()?) >> 16 == 5)
+        };
+        if self.stage == HwStage::Ms && compute() == Some(true) {
+            MESH_COMPUTE_SPACES
+        } else {
+            0
+        }
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -381,6 +426,202 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
+}
+
+/// What a mesh program translated by [`translate_mesh_as_compute`] writes,
+/// for hosts without mesh shaders (an experiment, issue #3).
+///
+/// The program is a compute shader with the mesh program's thread group,
+/// dispatched with the title's group count in x. It binds the user data,
+/// samplers and root views as any translated shader, and three raw UAVs
+/// in [`MESH_OUT_SPACE`]. Group `g` writes:
+///
+/// * `u0`, vertices: vertex `v` at record `g * max_vertices + v`, each record
+///   [`vertex_dwords`](Self::vertex_dwords) dwords: four per element of
+///   the mesh program's output signature, in signature order, the raw bits
+///   it exports (32-bit floats or integers as the element declares).
+/// * `u1`, triangles: primitive `p` at record `g * max_primitives + p`, three
+///   32-bit indices into `u0`'s records (the group's first vertex added).
+///   Triangles no lane exports, or exports culled, are `0, 0, 0` (no area),
+///   so an indexed draw of `3 * max_primitives` indices per group draws the
+///   group's triangles.
+/// * `u2`, per-primitive outputs: record `g * max_primitives + p`, four
+///   dwords per element of the primitive signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLayout {
+    /// Lanes per group (`[numthreads(threads, 1, 1)]`).
+    pub threads: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// Dwords per vertex record in `u0`.
+    pub vertex_dwords: u32,
+    /// Dwords per primitive record in `u2` (0: none).
+    pub primitive_dwords: u32,
+}
+
+impl MeshLayout {
+    /// Bytes `groups` groups write to `u0`, `u1` and `u2`.
+    pub fn bytes(&self, groups: u32) -> [u64; 3] {
+        let g = u64::from(groups);
+        [
+            g * u64::from(self.max_vertices) * u64::from(self.vertex_dwords) * 4,
+            g * u64::from(self.max_primitives) * 12,
+            g * u64::from(self.max_primitives) * u64::from(self.primitive_dwords) * 4,
+        ]
+    }
+}
+
+/// A mesh program for hosts without mesh shaders: the compute shader that
+/// runs it, and the vertex shader that draws what it wrote.
+///
+/// To draw `groups` groups: dispatch [`compute`](Self::compute) with
+/// `(groups, 1, 1)` and the `u0`-`u2` buffers of [`MeshLayout::bytes`];
+/// then bind `u0`-`u2` as the root SRVs `t0`-`t2` in [`MESH_OUT_SPACE`] and
+/// draw [`vertex`](Self::vertex) with the title's pixel shader as a
+/// triangle list of `3 * max_primitives * groups`:
+///
+/// * indices, with `u1` as a 32-bit index buffer;
+/// * or, when [`expanded`](Self::expanded), vertices (no index buffer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshFallback {
+    pub compute: HostShader,
+    pub vertex: HostShader,
+    /// The program has per-primitive outputs: the vertex shader passes them
+    /// on as constant outputs, drawn three unshared vertices per primitive.
+    pub expanded: bool,
+    pub layout: MeshLayout,
+}
+
+/// D3D12's limit on what one mesh shader group outputs, in bytes
+/// (DirectX-Specs `d3d/MeshShader.md`, "Mesh shader output size limits").
+/// The compute form of a [`MeshFallback`] writes to buffers and has none.
+pub const MESH_OUTPUT_LIMIT: u32 = 32 * 1024;
+
+/// What D3D12 counts against [`MESH_OUTPUT_LIMIT`]: 4 bytes per component
+/// of every vertex output element times the vertex maximum rounded up to
+/// 32, plus the same for the primitive outputs and maximum.
+fn mesh_output_bytes_of(
+    outputs: &[container::SigElement],
+    prims: &[container::SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u32 {
+    let bytes =
+        |els: &[container::SigElement]| els.iter().map(|e| 4 * u32::from(e.cols)).sum::<u32>();
+    bytes(outputs) * max_vertices.next_multiple_of(32)
+        + bytes(prims) * max_primitives.next_multiple_of(32)
+}
+
+/// What the mesh program of a console shader container outputs per group,
+/// as D3D12 counts it against [`MESH_OUTPUT_LIMIT`], with the signatures and
+/// maxima the translation declares; `None` without a mesh program.
+pub fn mesh_output_bytes(container: &[u8]) -> Result<Option<u32>, ShaderError> {
+    let c = Container::parse(container)?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Ok(None);
+    };
+    let Some(native) = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+    else {
+        return Ok(None);
+    };
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Ok(None);
+    };
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        c.part(fourcc).map_or(Ok(Vec::new()), |p| signature(p.data))
+    };
+    let outputs = sig(FourCC::OSG1)?;
+    // As `emit` declares them: without the primitive id and cull flag.
+    let mut prims = sig(FourCC::PSG1)?;
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    Ok(Some(mesh_output_bytes_of(
+        &outputs,
+        &prims,
+        ms.max_vertices,
+        ms.max_primitives,
+    )))
+}
+
+/// Translates the mesh program of a console shader container as a compute
+/// shader that writes its vertices and triangles to buffers, and the
+/// vertex shader that draws them ([`MeshFallback`]).
+pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a mesh program",
+        })?;
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // As `translate`: structurisation first, for per-lane descriptors.
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit_mesh_as_compute(&c, &native, &p, &st, &io, &res)
+}
+
+/// [`translate_mesh_as_compute`] for a program whose earlier stages already
+/// ran.
+pub fn emit_mesh_as_compute(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<MeshFallback, ShaderError> {
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh program run as compute that is no mesh program",
+        });
+    };
+    let (compute, _, outputs, prims) = emit_with(c, native, p, st, io, res, true)?;
+    let layout = MeshLayout {
+        threads: ms.threads,
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        vertex_dwords: 4 * outputs.len() as u32,
+        primitive_dwords: 4 * prims.len() as u32,
+    };
+    Ok(MeshFallback {
+        compute,
+        vertex: fallback_vertex_shader(&outputs, &prims, &layout),
+        expanded: !prims.is_empty(),
+        layout,
+    })
+}
+
+/// The vertex shader of a [`MeshFallback`].
+fn fallback_vertex_shader(
+    outputs: &[container::SigElement],
+    prims: &[container::SigElement],
+    layout: &MeshLayout,
+) -> HostShader {
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: mesh_vs::vertex_shader(
+            outputs,
+            prims,
+            layout.vertex_dwords,
+            layout.primitive_dwords,
+        ),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -731,6 +972,21 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_with(c, native, p, st, io, res, false).map(|(shader, wave, ..)| (shader, wave))
+}
+
+/// [`emit_program`], or a mesh program as compute: the shader, the wave
+/// size it requires, and the output and per-primitive signatures it was
+/// lowered with.
+fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    mesh_as_compute: bool,
+) -> Result<(HostShader, Option<u32>, Vec<container::SigElement>, Vec<container::SigElement>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -794,6 +1050,7 @@ fn emit_program(
         }
         _ => 0,
     };
+    let kept = (outputs.clone(), prims.clone());
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -804,6 +1061,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        mesh_as_compute,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -828,7 +1086,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
     };
-    Ok((shader, wave_size))
+    Ok((shader, wave_size, kept.0, kept.1))
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed
@@ -2579,6 +2837,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_as_compute: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -3201,5 +3460,48 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// D3D12's mesh output size: 4 bytes per component of every element,
+    /// times the maxima rounded up to 32.
+    #[test]
+    fn mesh_output_size_counts_components_and_rounds_maxima_up_to_32() {
+        let el = |kind, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        // One float4 position per vertex, 64 vertices: 16 * 64.
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 64, 0), 1024);
+        // 33 vertices count as 64, 1 as 32.
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 33, 0), 1024);
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 1, 0), 512);
+        // A float2 is 8 bytes, not a row's 16.
+        assert_eq!(mesh_output_bytes_of(&[el(0, 2)], &[], 32, 0), 256);
+        // Primitive outputs count against the primitive maximum.
+        assert_eq!(
+            mesh_output_bytes_of(&[el(3, 4)], &[el(0, 1)], 32, 126),
+            512 + 4 * 128
+        );
+        // 8 float4s for 256 vertices is exactly the limit; one more
+        // component is over it.
+        let at = vec![el(0, 4); 8];
+        assert_eq!(mesh_output_bytes_of(&at, &[], 256, 0), MESH_OUTPUT_LIMIT);
+        let mut over = at.clone();
+        over.push(el(0, 1));
+        assert!(mesh_output_bytes_of(&over, &[], 256, 0) > MESH_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn a_container_without_a_mesh_program_has_no_mesh_output_size() {
+        let bytes = crate::dxbc::build(&[]);
+        assert!(matches!(mesh_output_bytes(&bytes), Ok(None)));
     }
 }
