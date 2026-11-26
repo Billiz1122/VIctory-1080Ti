@@ -1083,6 +1083,14 @@ fn frame_ends() {
             crate::cores::settle();
         }
     }
+    for (i, switch) in ["VICTORY_CHAIN_ABOVE", "VICTORY_LIST_BELOW"].into_iter().enumerate() {
+        if let Some(on) = crate::ab::pick(switch) {
+            static WAS: [std::sync::atomic::AtomicBool; 2] = [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+            if WAS[i].swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+                crate::cores::settle_chain();
+            }
+        }
+    }
     if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
         static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {

@@ -202,8 +202,10 @@ pub(crate) fn settle() {
             Some((own, _)) if lane => own,
             _ => &helpers,
         };
-        // SAFETY: a handle kept open, and the system's own set ids.
-        unsafe { SetThreadSelectedCpuSets(thread as _, sets.as_ptr(), sets.len() as u32) };
+        // SAFETY: a handle kept open, and the system's own set ids (none: the
+        // process's).
+        let at = if sets.is_empty() { null } else { sets.as_ptr() };
+        unsafe { SetThreadSelectedCpuSets(thread as _, at, sets.len() as u32) };
     }
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
@@ -213,6 +215,58 @@ pub(crate) fn settle() {
         threads = ASKED.lock().unwrap_or_else(|e| e.into_inner()).len(),
         "our threads' processors (VICTORY_CACHE_CORES)"
     );
+}
+
+/// Handles of the threads a frame's chain goes through beside the
+/// submitting one: the helpers of its preparing and of the landing, the
+/// relay, the heaps' records.
+static CHAIN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether those threads run above normal priority, as the submitting thread
+/// does (`VICTORY_CHAIN_ABOVE=1`). Each is woken for a few hundred
+/// microseconds of work at a time, and stood ready behind the eight threads
+/// that translate lists and the title's own until one of them gave way: of a
+/// frame of 90 ms in the prologue's cell, 9 to 15 ms were threads on the
+/// chain woken and not running yet (timeline tl-a, Ryzen 5 2600X, six cores,
+/// 2026-11-27).
+fn chain_above() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CHAIN_ABOVE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CHAIN_ABOVE").is_some_and(|v| v == "1"))
+}
+
+/// Handles of the threads that translate lists.
+static LISTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the threads that translate lists run below normal priority
+/// (`VICTORY_LIST_BELOW=1`): the title's own threads, which make the frame,
+/// get a processor before them.
+fn list_below() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_BELOW") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_BELOW").is_some_and(|v| v == "1"))
+}
+
+/// Tells the chain's threads and those that translate lists their
+/// priorities ([`chain_above`], [`list_below`], which may have changed).
+pub(crate) fn settle_chain() {
+    use windows_sys::Win32::System::Threading::{
+        SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+    };
+    let chain = if chain_above() { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+    let lists = if list_below() { THREAD_PRIORITY_BELOW_NORMAL } else { THREAD_PRIORITY_NORMAL };
+    for (threads, priority) in [(&CHAIN, chain), (&LISTS, lists)] {
+        for &thread in threads.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            // SAFETY: a handle kept open.
+            unsafe { SetThreadPriority(thread as _, priority) };
+        }
+    }
 }
 
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
@@ -250,6 +304,17 @@ fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenThread, THREAD_SET_LIMITED_INFORMATION,
     };
+    // (The submitting thread sets its own priority; the many that translate
+    // lists work ahead of the chain.)
+    if !matches!(what, "victory-submit" | "test") {
+        // SAFETY: our own thread; the handle stays open.
+        let thread = unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+        if !thread.is_null() {
+            let of = if what == "victory-list" { &LISTS } else { &CHAIN };
+            of.lock().unwrap_or_else(|e| e.into_inner()).push(thread as usize);
+            settle_chain();
+        }
+    }
     if stage() < from {
         return;
     }
@@ -260,8 +325,10 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but the core the
+    // submitting thread may have to itself ([`lane_core`]), which needs no
+    // fast ones (a Ryzen 5 2600X, six cores of one kind, never got it).
+    if fast.is_empty() && what != "victory-submit" {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
