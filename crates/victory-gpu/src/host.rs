@@ -5267,7 +5267,7 @@ impl Host {
         let mut telling = std::time::Instant::now();
         for item in items {
             telling = match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -5278,6 +5278,7 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
+                    flight.lists.iter_mut().for_each(crate::list::Detached::tables_done);
                     landed.push((flight.lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
@@ -5753,7 +5754,7 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
@@ -5761,6 +5762,7 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
+                        flight.lists.iter_mut().for_each(crate::list::Detached::tables_done);
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),

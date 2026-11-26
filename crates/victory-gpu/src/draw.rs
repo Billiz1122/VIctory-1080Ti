@@ -1457,7 +1457,14 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
-        if !self.bind(list, p, false) {
+        // A mesh pipeline drawn by its fallback: the vertex shader reads only
+        // what the mesh program wrote (`t0`-`t2`, `emit::mesh_vs`), so the
+        // mesh stage's own arguments are bound for its compute pass alone.
+        // Bound here too, every such draw made its tables, root views and
+        // constants twice (2.6 s of the translating threads a frame in
+        // gameplay, tables refused for want of dynamic slots).
+        let stages = if p.fallback.is_some() { &p.stages[1..] } else { &p.stages[..] };
+        if !self.bind_as(list, p, &p.pso, stages, false, false) {
             return false;
         }
         let l = &list.list;

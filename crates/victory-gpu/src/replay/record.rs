@@ -1950,7 +1950,12 @@ unsafe fn note(this: Ptr, cmd: impl FnOnce(&Recorder) -> Cmd) {
 unsafe extern "system" fn list_close(this: Ptr) -> HRESULT {
     // SAFETY: as above.
     unsafe {
+        let table = hook::table(this);
         let hr = own!(this, ID3D12GraphicsCommandList_Vtbl.Close)(this);
+        // A close sets the list's table pointer anew too (D3D12 1.620 on
+        // Windows 10: without this the state below was read out of the
+        // runtime's own table, and the write ended the process).
+        hook::again(this, table, list_table);
         if let Some((_, state)) = of(this) {
             let mut inner = lock(&state.inner);
             let bytes = std::mem::take(&mut inner.bytes);

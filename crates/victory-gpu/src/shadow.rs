@@ -5647,29 +5647,48 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
+    /// Askings between two looks for idle copies. Looking at every asking
+    /// that found none (280 a frame in gameplay, over 3,500 kept, each with
+    /// two calls into its buffer) and making the new buffer, all under the
+    /// one lock, was where the threads that translate lists stood: a
+    /// quarter of all their time, more than half of what they did not spend
+    /// waiting for work (profile, GTX 1080 Ti, 2026-11-26).
+    const LOOK_EVERY: u64 = 2048;
+    static LOOKED: AtomicU64 = AtomicU64::new(0);
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let now = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY && now >= LOOKED.load(Ordering::Relaxed) + LOOK_EVERY {
+            LOOKED.store(now, Ordering::Relaxed);
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used)| {
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            });
+        }
+        now
+    };
+    // The buffer is made outside the lock; another thread may have made the
+    // copy meanwhile, and then that one is taken.
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+    if let Some((shadow, used)) = guard.1.get_mut(&(address, len)) {
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    guard.1.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

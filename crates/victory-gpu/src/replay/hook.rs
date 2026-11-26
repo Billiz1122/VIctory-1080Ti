@@ -28,6 +28,12 @@ const TO_ORIG: usize = std::mem::offset_of!(Shim, table) - std::mem::offset_of!(
 /// The shims made, by the address objects point at.
 static MADE: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
 
+/// The shims made, by what they stand for: (state, the object's own table) →
+/// the shim's table. An object that is given another table of its own at
+/// some calls ([`again`]) gets the shim it had for that table back, not a new
+/// one each time (shims are never freed).
+static BY_OWN: Mutex<std::collections::BTreeMap<(usize, usize), usize>> = Mutex::new(std::collections::BTreeMap::new());
+
 unsafe fn shim(this: *mut c_void) -> *const Shim {
     // SAFETY: the caller's object points into a shim.
     unsafe {
@@ -126,6 +132,7 @@ pub(super) unsafe fn install(
     patch(&mut new.table);
     let new: &'static Shim = Box::leak(new);
     made.insert(new.table.as_ptr() as usize);
+    BY_OWN.lock().unwrap_or_else(|e| e.into_inner()).insert((state as usize, at), new.table.as_ptr() as usize);
     // SAFETY: the object's first word, its table's address.
     unsafe { this.cast::<*const usize>().write(new.table.as_ptr()) };
     true
@@ -172,8 +179,16 @@ pub(super) unsafe fn again(
             .cast::<Shim>();
         if (*shim).orig as usize == now {
             this.cast::<usize>().write(before);
-        } else {
-            install(this, (*shim).state, patch);
+            return;
+        }
+        // Another table of its own (D3D12 1.620 gives a list one at Close
+        // and the first back at Reset): the shim made for that one.
+        let had = BY_OWN.lock().unwrap_or_else(|e| e.into_inner()).get(&((*shim).state as usize, now)).copied();
+        match had {
+            Some(table) => this.cast::<usize>().write(table),
+            None => {
+                install(this, (*shim).state, patch);
+            }
         }
     }
 }

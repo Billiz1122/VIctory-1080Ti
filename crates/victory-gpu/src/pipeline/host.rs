@@ -432,6 +432,14 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
+    // Which pipelines go without, and why (the first of them).
+    #[cfg(feature = "diagnostics")]
+    {
+        static NAMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if NAMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+            tracing::info!(?shaders, "refused: {reason}");
+        }
+    }
     None
 }
 

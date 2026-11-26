@@ -203,6 +203,16 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// The card has run it: its dynamic descriptor slots go back now
+    /// ([`crate::draw::State::tables_done`]), not when the host list is
+    /// reset, which waits some submissions longer (`crate::host`'s bury
+    /// lag). Held that long, a host heap capped at 1,000,000 views ran out
+    /// of them in the world: 1,564 of 10,939 tables a frame were refused
+    /// and their draws dropped (trial v2-lock).
+    pub(crate) fn tables_done(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
