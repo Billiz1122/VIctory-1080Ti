@@ -27,8 +27,9 @@
 //! first vertex follows from the hardware's provoking-vertex setting for
 //! triangles; it is not measured on a rectangle.
 
-use super::bitcode::{Attr, Bin, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
+use super::lower::EMULATED;
 use super::shader::{Geometry, Shader};
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
@@ -60,22 +61,43 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
         Some(ps) => sig(ps, FourCC::ISG1)?,
         None => Vec::new(),
     };
-    build(outputs, &wanted)
+    build(outputs, &wanted, true)
 }
 
-/// [`rect_list_gs`] from the vertex shader's outputs and the pixel
-/// shader's inputs.
-fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
+/// The geometry shader (a DXIL container) for triangles drawn with the
+/// translated vertex shader `vs` and a pixel shader `ps` translated for a
+/// host without barycentrics (`lower::with_emulated_barycentrics`), which
+/// reads inputs of its own in their place: every vertex goes out as it came,
+/// with the weights of the triangle's three vertices (one at its own) and
+/// the elements the pixel shader reads at the second and third vertex, the
+/// same at all three. (A mesh pipeline drawn without mesh shaders has them
+/// from its vertex shader, `mesh_vs`; a vertex shader of the title's sees
+/// one vertex, so a stage behind it writes them. Rectangle lists get them
+/// from [`rect_list_gs`].)
+pub fn barycentric_gs(vs: &[u8], ps: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    let sig = |dxil: &[u8], fourcc| -> Result<Vec<SigElement>, ShaderError> {
+        let c = Container::parse(dxil)?;
+        match c.part(fourcc) {
+            Some(part) => super::signature(part.data),
+            None => Ok(Vec::new()),
+        }
+    };
+    build(sig(vs, FourCC::OSG1)?, &sig(ps, FourCC::ISG1)?, false)
+}
+
+/// [`rect_list_gs`] (`rectangles`) or [`barycentric_gs`] from the vertex
+/// shader's outputs and the pixel shader's inputs.
+fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], rectangles: bool) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
     if outputs.iter().any(|e| e.row.is_none()) {
         return Err(unsupported("a rectangle list output without a register"));
     }
-    let Some(position) = outputs
+    let position = outputs
         .iter()
-        .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4)
-    else {
+        .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4);
+    if rectangles && position.is_none() {
         return Err(unsupported("a rectangle list without a four-component position"));
-    };
+    }
     for e in &mut outputs {
         // Interpolation as `emit_program` declares a vertex shader's
         // outputs; a geometry shader's inputs carry the same modes.
@@ -87,11 +109,74 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    let vertices = if rectangles { VERTICES } else { 3 };
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
-        max_vertices: VERTICES,
+        max_vertices: vertices,
     });
     s.inputs = outputs.clone();
+    let b = s.entry;
+
+    // Every input of the three vertices: [element][column][vertex].
+    let mut corners: Vec<Vec<[V; 3]>> = Vec::new();
+    for id in 0..s.inputs.len() {
+        let mut columns = Vec::new();
+        for col in 0..s.inputs[id].cols {
+            columns.push([0, 1, 2].map(|vertex| load(&mut s, id, col, vertex)));
+        }
+        corners.push(columns);
+    }
+    // Whether an output continues into a rectangle's fourth corner (floats);
+    // the others are the first vertex's there.
+    let mut continued: Vec<bool> = s.inputs.iter().map(|e| e.comp == 9).collect();
+
+    // The inputs a pixel shader reads in place of barycentrics, as outputs
+    // after the vertex shader's, at the registers it has them.
+    for x in ps_inputs.iter().filter(|e| e.kind == 0 && EMULATED.contains(&e.name.as_str())) {
+        if x.row.is_none() || x.col != 0 || outputs.iter().any(|o| o.row == x.row) {
+            return Err(unsupported("a register of the pixel shader's emulated inputs is taken"));
+        }
+        let weights = x.name == EMULATED[0];
+        let mut columns = Vec::new();
+        if weights {
+            // One at the vertex itself, none at the other two; a rectangle's
+            // fourth corner continues them as it does every float.
+            let (one, none) = (s.m.f32(1f32.to_bits()), s.m.f32(0));
+            for col in 0..x.cols {
+                columns.push([0u8, 1, 2].map(|vertex| if vertex == col { one } else { none }));
+            }
+        } else {
+            // The element at the triangle's vertex 1 or 2: its register row
+            // and first column are in the semantic index.
+            let k = if x.name == EMULATED[1] { 1 } else { 2 };
+            let (row, first) = (x.index / 4, (x.index % 4) as u8);
+            let found = s
+                .inputs
+                .iter()
+                .enumerate()
+                .find(|(_, o)| o.row == Some(row) && o.col <= first && first + x.cols <= o.col + o.cols)
+                .map(|(n, o)| (n, o.col, o.comp == 9));
+            let Some((n, of_col, float)) = found else {
+                return Err(unsupported("an input read at a vertex that the vertex shader does not write"));
+            };
+            for col in 0..x.cols {
+                let mut v = corners[n][usize::from(first - of_col + col)][k];
+                if float != (x.comp == 9) {
+                    let to = if x.comp == 9 { s.t.f32 } else { s.t.i32 };
+                    v = s.m.cast(b, Cast::Bitcast, v, to);
+                }
+                columns.push([v; 3]);
+            }
+        }
+        corners.push(columns);
+        continued.push(weights);
+        outputs.push(SigElement {
+            interp: if weights { 2 } else { 1 },
+            usage: (1 << x.cols) - 1,
+            ..x.clone()
+        });
+    }
+
     // The primitive id the pixel shader declares, as one more output.
     let wanted = ps_inputs
         .iter()
@@ -119,88 +204,83 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         None => None,
     };
     let scalars: u32 = outputs.iter().map(|e| u32::from(e.cols)).sum();
-    if scalars * VERTICES > MAX_SCALARS {
+    if scalars * vertices > MAX_SCALARS {
         return Err(unsupported(
             "a rectangle list with more output components than a geometry shader emits",
         ));
     }
     s.outputs = outputs;
-    let b = s.entry;
 
-    // Every input of the three vertices: [element][column][vertex].
-    let mut corners: Vec<Vec<[V; 3]>> = Vec::new();
-    for id in 0..s.inputs.len() {
-        let mut columns = Vec::new();
-        for col in 0..s.inputs[id].cols {
-            columns.push([0, 1, 2].map(|vertex| load(&mut s, id, col, vertex)));
-        }
-        corners.push(columns);
-    }
-
-    // One positive w, and no two vertices in one place.
-    let (x, y, w) = (
-        corners[position][0],
-        corners[position][1],
-        corners[position][3],
-    );
-    let zero = s.m.f32(0);
-    let mut plain = s.m.cmp(b, pred::OGT, w[0], zero);
-    for &other in &w[1..] {
-        let one_w = same(&mut s, other, w[0]);
-        plain = both(&mut s, plain, one_w);
-    }
-    for (i, j) in [(0, 1), (0, 2), (1, 2)] {
-        let (same_x, same_y) = (same(&mut s, x[i], x[j]), same(&mut s, y[i], y[j]));
-        let together = both(&mut s, same_x, same_y);
-        let apart = not(&mut s, together);
-        plain = both(&mut s, plain, apart);
-    }
-    // corner[i]: vertex i is the corner between the other two (the first
-    // that shares x with one of them and y with the other).
-    let mut corner: Vec<V> = Vec::new();
-    for i in 0..3 {
-        let (a, c) = ((i + 1) % 3, (i + 2) % 3);
-        let (xa, yc) = (same(&mut s, x[i], x[a]), same(&mut s, y[i], y[c]));
-        let (xc, ya) = (same(&mut s, x[i], x[c]), same(&mut s, y[i], y[a]));
-        let (one, other) = (both(&mut s, xa, yc), both(&mut s, xc, ya));
-        let shares = either(&mut s, one, other);
-        let mut here = both(&mut s, shares, plain);
-        for &found in &corner {
-            let earlier = not(&mut s, found);
-            here = both(&mut s, here, earlier);
-        }
-        corner.push(here);
-    }
-
-    // What the six emitted vertices carry: [element][column][vertex].
+    // What the emitted vertices carry: [element][column][vertex]. A
+    // triangle's are its own three (the last three are not emitted).
     let mut emitted: Vec<Vec<[V; 6]>> = Vec::new();
-    for (id, columns) in corners.iter().enumerate() {
-        let float = s.inputs[id].comp == 9;
-        let mut out = Vec::new();
-        for &[p0, p1, p2] in columns {
-            // The fourth vertex: `a + b - corner`. Integers (flat), and
-            // three vertices without a corner, keep the first vertex's
-            // value; the second triangle of the latter is then empty.
-            let mut fourth = p0;
-            if float {
-                for (k, (a, c, at)) in [(p1, p2, p0), (p2, p0, p1), (p0, p1, p2)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let sum = s.m.bin(b, Bin::Add, a, c);
-                    let opposite = s.m.bin(b, Bin::Sub, sum, at);
-                    fourth = s.m.select(b, corner[k], opposite, fourth);
-                }
-            }
-            // Corner first: (v0, v1, v3), (v0, v3, v2). Second: (v0, v1,
-            // v2), (v0, v2, v3). Third: (v0, v1, v2), (v0, v3, v1).
-            let third = s.m.select(b, corner[0], fourth, p2);
-            let fifth = s.m.select(b, corner[1], p2, fourth);
-            let sixth = s.m.select(b, corner[0], p2, p1);
-            let sixth = s.m.select(b, corner[1], fourth, sixth);
-            out.push([p0, p1, third, p0, fifth, sixth]);
+    if let (true, Some(position)) = (rectangles, position) {
+        // One positive w, and no two vertices in one place.
+        let (x, y, w) = (
+            corners[position][0],
+            corners[position][1],
+            corners[position][3],
+        );
+        let zero = s.m.f32(0);
+        let mut plain = s.m.cmp(b, pred::OGT, w[0], zero);
+        for &other in &w[1..] {
+            let one_w = same(&mut s, other, w[0]);
+            plain = both(&mut s, plain, one_w);
         }
-        emitted.push(out);
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let (same_x, same_y) = (same(&mut s, x[i], x[j]), same(&mut s, y[i], y[j]));
+            let together = both(&mut s, same_x, same_y);
+            let apart = not(&mut s, together);
+            plain = both(&mut s, plain, apart);
+        }
+        // corner[i]: vertex i is the corner between the other two (the first
+        // that shares x with one of them and y with the other).
+        let mut corner: Vec<V> = Vec::new();
+        for i in 0..3 {
+            let (a, c) = ((i + 1) % 3, (i + 2) % 3);
+            let (xa, yc) = (same(&mut s, x[i], x[a]), same(&mut s, y[i], y[c]));
+            let (xc, ya) = (same(&mut s, x[i], x[c]), same(&mut s, y[i], y[a]));
+            let (one, other) = (both(&mut s, xa, yc), both(&mut s, xc, ya));
+            let shares = either(&mut s, one, other);
+            let mut here = both(&mut s, shares, plain);
+            for &found in &corner {
+                let earlier = not(&mut s, found);
+                here = both(&mut s, here, earlier);
+            }
+            corner.push(here);
+        }
+        for (id, columns) in corners.iter().enumerate() {
+            let float = continued[id];
+            let mut out = Vec::new();
+            for &[p0, p1, p2] in columns {
+                // The fourth vertex: `a + b - corner`. Integers (flat), and
+                // three vertices without a corner, keep the first vertex's
+                // value; the second triangle of the latter is then empty.
+                let mut fourth = p0;
+                if float {
+                    for (k, (a, c, at)) in [(p1, p2, p0), (p2, p0, p1), (p0, p1, p2)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let sum = s.m.bin(b, Bin::Add, a, c);
+                        let opposite = s.m.bin(b, Bin::Sub, sum, at);
+                        fourth = s.m.select(b, corner[k], opposite, fourth);
+                    }
+                }
+                // Corner first: (v0, v1, v3), (v0, v3, v2). Second: (v0, v1,
+                // v2), (v0, v2, v3). Third: (v0, v1, v2), (v0, v3, v1).
+                let third = s.m.select(b, corner[0], fourth, p2);
+                let fifth = s.m.select(b, corner[1], p2, fourth);
+                let sixth = s.m.select(b, corner[0], p2, p1);
+                let sixth = s.m.select(b, corner[1], fourth, sixth);
+                out.push([p0, p1, third, p0, fifth, sixth]);
+            }
+            emitted.push(out);
+        }
+    } else {
+        for columns in &corners {
+            emitted.push(columns.iter().map(|&[p0, p1, p2]| [p0, p1, p2, p0, p0, p0]).collect());
+        }
     }
 
     // The rectangle's number: the triangle's, three vertices a rectangle.
@@ -210,7 +290,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         number = Some((id, n));
     }
     let stream = s.m.i8(0);
-    for vertex in 0..VERTICES as usize {
+    for vertex in 0..vertices as usize {
         for (id, columns) in emitted.iter().enumerate() {
             let name = if s.outputs[id].comp == 9 {
                 "storeOutput.f32"
@@ -232,8 +312,8 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &[stream]);
-        // The strip ends after the first triangle.
-        if vertex == 2 {
+        // A rectangle's strip ends after the first triangle.
+        if rectangles && vertex == 2 {
             s.op(b, "cutStream", Attr::NoUnwind, s.t.void, 98, &[stream]);
         }
     }
@@ -314,7 +394,7 @@ mod tests {
     #[test]
     fn the_rectangle_stage_is_a_geometry_shader() {
         let wanted = [element("SV_PrimitiveID", 0, 10, 5, 3, 1)];
-        let gs = build(outputs(), &wanted).unwrap();
+        let gs = build(outputs(), &wanted, true).unwrap();
         let c = Container::parse(&gs).unwrap();
         // Program version: geometry (2), shader model 6.6.
         assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
@@ -337,21 +417,64 @@ mod tests {
             super::super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut gs.clone()).unwrap();
-            let plain = build(outputs(), &[]).unwrap();
+            let plain = build(outputs(), &[], true).unwrap();
             v.validate(&mut plain.clone()).unwrap();
         }
+    }
+
+    /// What a pixel shader translated for a host without barycentrics reads
+    /// in their place: the weights, and TEXCOORD0 (register 1) at the second
+    /// and third vertex.
+    fn emulated() -> Vec<SigElement> {
+        vec![
+            element(EMULATED[0], 0, 0, 9, 5, 3),
+            element(EMULATED[1], 4, 0, 9, 6, 4),
+            element(EMULATED[2], 4, 0, 9, 7, 4),
+        ]
+    }
+
+    /// The stage for a triangle's weights is a geometry shader of triangles
+    /// in and three strip vertices out, with the vertex shader's outputs on
+    /// both sides and the pixel shader's own inputs behind them; a
+    /// rectangle's stage writes them too. The validator, where there is
+    /// one, accepts both.
+    #[test]
+    fn the_weights_stage_is_a_geometry_shader() {
+        for (rectangles, vertices) in [(false, 3), (true, 6)] {
+            let gs = build(outputs(), &emulated(), rectangles).unwrap();
+            let c = Container::parse(&gs).unwrap();
+            assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            // Geometry stage, the vertices, three inputs, six outputs.
+            assert_eq!(psv[28..34], [2, 0, vertices, 0, 3, 6]);
+            let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            let rows: Vec<_> = outs.iter().map(|o| (o.name.as_str(), o.row, o.cols)).collect();
+            assert_eq!(rows[3..], [("VBARY", Some(5), 3), ("VATA", Some(6), 4), ("VATB", Some(7), 4)]);
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut gs.clone()).unwrap();
+            }
+        }
+        // Refused: a register of theirs that a vertex output has, an
+        // element read at a vertex that the vertex shader does not write.
+        let taken = [element(EMULATED[0], 0, 0, 9, 1, 3)];
+        assert!(build(outputs(), &taken, false).is_err());
+        let unwritten = [element(EMULATED[1], 36, 0, 9, 6, 4)];
+        assert!(build(outputs(), &unwritten, false).is_err());
     }
 
     /// Refused with a reason: no position, a primitive id in a register a
     /// vertex output has, more components than six vertices may carry.
     #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
-        assert!(build(outputs()[1..].to_vec(), &[]).is_err());
+        assert!(build(outputs()[1..].to_vec(), &[], true).is_err());
         let taken = [element("SV_PrimitiveID", 0, 10, 5, 1, 1)];
-        assert!(build(outputs(), &taken).is_err());
+        assert!(build(outputs(), &taken, true).is_err());
         let mut many = vec![element("SV_Position", 0, 3, 9, 0, 4)];
         many.extend((1..=43).map(|row| element("TEXCOORD", row - 1, 0, 9, row, 4)));
-        assert!(build(many, &[]).is_err());
+        assert!(build(many, &[], true).is_err());
     }
 
     /// A vertex shader that passes a position and a float4 through, and a
@@ -420,6 +543,122 @@ mod tests {
             host(crate::native::HwStage::Vs, vs),
             host(crate::native::HwStage::Ps, ps),
         )
+    }
+
+    /// A pixel shader that writes TEXCOORD0 as one translated for a host
+    /// without barycentrics puts it together: the first vertex's value (the
+    /// element itself, constant) and those at the other two, by the weights.
+    #[cfg(windows)]
+    fn weighted() -> super::super::HostShader {
+        let mut ps = Shader::new(true);
+        ps.inputs = vec![
+            SigElement {
+                interp: 4,
+                ..element("SV_Position", 0, 3, 9, 0, 4)
+            },
+            SigElement {
+                interp: 1,
+                usage: 15,
+                ..element("TEXCOORD", 0, 0, 9, 1, 4)
+            },
+        ];
+        for (mut e, interp) in emulated().into_iter().zip([2, 1, 1]) {
+            e.interp = interp;
+            e.usage = (1 << e.cols) - 1;
+            ps.inputs.push(e);
+        }
+        ps.outputs = vec![SigElement {
+            usage: 15,
+            ..element("SV_Target", 0, 16, 9, 0, 4)
+        }];
+        let b = ps.entry;
+        let input = |s: &mut Shader, id: u32, col: u8| {
+            let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+        };
+        let weights = [0, 1, 2].map(|col| input(&mut ps, 2, col));
+        for col in 0..4 {
+            let mut sum = None;
+            for (vertex, id) in [1, 3, 4].into_iter().enumerate() {
+                let value = input(&mut ps, id, col);
+                let part = ps.m.bin(b, Bin::Mul, weights[vertex], value);
+                sum = Some(match sum {
+                    Some(sum) => ps.m.bin(b, Bin::Add, sum, part),
+                    None => part,
+                });
+            }
+            let args = [ps.m.i32(0), ps.m.i32(0), ps.m.i8(col), sum.unwrap()];
+            ps.op(b, "storeOutput.f32", Attr::NoUnwind, ps.t.void, 5, &args);
+        }
+        ps.m.terminate(b, Term::Ret);
+        super::super::HostShader {
+            stage: crate::native::HwStage::Ps,
+            dxil: ps.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        }
+    }
+
+    /// A triangle over the whole target whose vertices differ in TEXCOORD0:
+    /// the pixel shader that puts the value together from the stage's
+    /// weights and the three vertices' values draws what the host's own
+    /// interpolation draws, texel for texel.
+    #[test]
+    #[cfg(windows)]
+    fn a_triangles_weights_draw_what_interpolation_draws() {
+        use super::super::host::{Draw, Host};
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let (vs, plain) = pass_through();
+        let ps = weighted();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut ps.dxil.clone()).unwrap();
+        }
+        let gs = barycentric_gs(&vs.dxil, &ps.dxil).unwrap();
+        let root = host.root_signature(&vs, &ps).unwrap();
+        // Position (z 0.5, w 1, then one with w 3) and a value of its own.
+        for (name, w) in [("one depth", [1.0, 1.0, 1.0]), ("three depths", [1.0, 3.0, 2.0])] {
+            let corners: [(f32, f32, [f32; 4]); 3] = [
+                (-1.0, 1.0, [1.0, 0.0, 0.25, 4.0]),
+                (-1.0, -3.0, [0.0, 1.0, 0.5, -2.0]),
+                (3.0, 1.0, [0.0, 0.0, 1.0, 8.0]),
+            ];
+            let mut vertices = Vec::new();
+            for (k, (x, y, value)) in corners.into_iter().enumerate() {
+                vertices.extend([x * w[k], y * w[k], 0.5 * w[k], w[k]]);
+                vertices.extend(value);
+            }
+            let draw = |gs: Option<&[u8]>, ps: &super::super::HostShader| {
+                let pso = host.pipeline_with_gs(&root, &vs.dxil, gs, &ps.dxil).unwrap();
+                let d = Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 32,
+                    size: (8, 8),
+                    mesh_groups: 0,
+                };
+                host.draw(&root, &pso, &d).unwrap()
+            };
+            let (want, got) = (draw(None, &plain), draw(Some(&gs[..]), &ps));
+            assert!(want.iter().any(|t| t[0] > 0.1) && want.iter().any(|t| t[1] > 0.1), "{name}: nothing drawn");
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert!(
+                    a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3),
+                    "{name}: texel {i} is {b:?}, not {a:?}"
+                );
+            }
+        }
     }
 
     /// Three corners of the whole target, the corner between the other two

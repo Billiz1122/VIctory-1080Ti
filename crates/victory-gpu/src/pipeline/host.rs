@@ -543,11 +543,12 @@ impl HostPipeline {
         {
             return refuse("a pixel shader reads barycentrics, which the host lacks", shaders);
         }
-        // One translated to read inputs of its own instead: only the vertex
-        // shader of a mesh pipeline drawn without mesh shaders writes them.
-        if fallback.is_none()
-            && stages.iter().any(|(s, _)| s.translated().is_some_and(|t| victory_shader::emit::emulates_barycentrics(&t.host.dxil)))
-        {
+        // One translated to read inputs of its own instead: the vertex shader
+        // of a mesh pipeline drawn without mesh shaders writes them, and for
+        // a vertex shader of the title's a geometry stage of ours behind it
+        // (below).
+        let emulates = stages.iter().any(|(s, _)| s.translated().is_some_and(|t| victory_shader::emit::emulates_barycentrics(&t.host.dxil)));
+        if emulates && fallback.is_none() && mesh.is_some() {
             return refuse("a pixel shader reads barycentrics, which the host lacks (no mesh pipeline to emulate them in)", shaders);
         }
         let host = host()?;
@@ -955,12 +956,36 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        // A pixel shader that reads inputs of its own in place of
+        // barycentrics gets them from a geometry stage behind the title's
+        // vertex shader (a rectangle's from the stage above): the weights of
+        // a triangle's vertices and what it reads at the other two. The hair
+        // of strands, every particle and the bloom's first pass were refused
+        // on a GTX 1080 Ti for want of it (58 pixel shaders, 2026-11-27).
+        let mut weights_gs = None;
+        if emulates && g.topology.0 != RECTANGLES {
+            if g.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE {
+                return refuse("a pixel shader reads barycentrics, which the host lacks (emulated for triangles only)", shaders);
+            }
+            let ps = stages.get(1).and_then(|(s, _)| s.translated())?;
+            let vs = &stages[0].0.translated()?.host.dxil;
+            match victory_shader::emit::barycentric_gs(vs, &ps.host.dxil) {
+                Ok(gs) => weights_gs = Some(gs),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no geometry stage for a pixel shader's inputs in place of barycentrics");
+                    return refuse("a pixel shader reads barycentrics, which the host lacks (no geometry stage to emulate them in)", shaders);
+                }
+            }
+        }
+        if emulates && g.topology.0 == RECTANGLES && rect_gs.is_none() {
+            return refuse("a pixel shader reads barycentrics, which the host lacks (no rectangle stage to emulate them in)", shaders);
+        }
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            GS: rect_gs.as_ref().or(weights_gs.as_ref()).map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -991,7 +1016,7 @@ impl HostPipeline {
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
             Some(gs) => super::library::name(
-                "graphics rectangles",
+                if weights_gs.is_some() { "graphics weights" } else { "graphics rectangles" },
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
                 &state,
@@ -1015,8 +1040,8 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
-        if made.is_err() && rect_gs.is_some() {
+        let mut made = make(&desc, &name(rect_gs.as_ref().or(weights_gs.as_ref())));
+        if made.is_err() && rect_gs.is_some() && !emulates {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
