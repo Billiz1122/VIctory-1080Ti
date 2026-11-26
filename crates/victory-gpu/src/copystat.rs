@@ -1,4 +1,4 @@
-//! Diagnostics: where the submission copies of title memory go (which
+﻿//! Diagnostics: where the submission copies of title memory go (which
 //! ranges, how often, of what memory) and what limits their rate, logged
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only). Set
@@ -1491,7 +1491,7 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    for (what, (n, us, longest)) in by.into_iter().take(600) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,

@@ -715,6 +715,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             skip = left();
         }
         if !only_sets(op) && crate::draw::pending() {
+            #[cfg(feature = "diagnostics")]
+            crate::draw::flushing_for((op as usize).min(62));
             flush();
         }
         if op == UPLOAD {
@@ -817,6 +819,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
     }
     if crate::draw::pending() {
+        #[cfg(feature = "diagnostics")]
+        crate::draw::flushing_for(65);
         flush();
     }
     crate::draw::deferring(was);
@@ -824,10 +828,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
 }
 
 /// The calls that only set what later draws and dispatches are bound with
-/// (and indirect executions, which see to waiting mesh draws themselves):
+/// (and indirect executions and mesh dispatches, which see to waiting mesh
+/// draws themselves):
 /// mesh draws that wait for their flush wait across them.
 fn only_sets(op: u64) -> bool {
-    const SETS: [u64; 9] = [
+    const SETS: [u64; 11] = [
+        Plain::DISPATCH_MESH as u64,
+        Plain::DISPATCH_MESH_X as u64,
         Plain::COMPUTE_TABLE as u64,
         Plain::GRAPHICS_TABLE as u64,
         Plain::COMPUTE_CONSTANT as u64,

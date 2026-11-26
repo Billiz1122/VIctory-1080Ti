@@ -573,15 +573,31 @@ struct Deferred {
     pipeline: usize,
     graphics: Vec<Root>,
     place: u32,
-    bounded: ID3D12Resource,
-    at: u64,
+    /// An indirect one's arguments: the buffer and where in it.
+    bounded: Option<(ID3D12Resource, u64)>,
+    /// A direct one's groups.
+    groups: u32,
 }
 
 /// `VICTORY_MESH_DEFER=0`: every mesh draw without mesh shaders is drawn
 /// right after its mesh program, as before.
 fn defers() -> bool {
+    // (One of `VICTORY_AB`'s switches: both ways in one run.)
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MESH_DEFER") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_DEFER").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics, as switches of `VICTORY_AB` only: what a frame takes without
+/// its mesh draws (`VICTORY_PROBE_NO_MESH`: none is recorded) and without
+/// their drawing (`VICTORY_PROBE_NO_MESH_DRAW`: the mesh programs run, what
+/// they wrote is not drawn). The differences are what those cost.
+#[cfg(feature = "diagnostics")]
+fn probe(switch: &str) -> bool {
+    crate::ab::pick(switch) == Some(true)
 }
 
 /// Since the last line: mesh draws that waited for a flush, and flushes.
@@ -590,6 +606,31 @@ static DEFERRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// [`DEFERRED`], taken.
 pub(crate) fn deferred_counts() -> (u64, u64) {
     (DEFERRED[0].swap(0, Ordering::Relaxed), DEFERRED[1].swap(0, Ordering::Relaxed))
+}
+
+/// Since the last line, what the flushes were for: by the stream's call
+/// (its number, up to 62; `crate::list::thin`), 63 for a full ring, 64 for a
+/// mesh draw or another indirect execution that does not wait, 65 for the
+/// stream's end (diagnostics).
+#[cfg(feature = "diagnostics")]
+static FLUSHED_FOR: [AtomicU64; 66] = [const { AtomicU64::new(0) }; 66];
+
+/// A flush is coming for `cause` ([`FLUSHED_FOR`]), if anything waits.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn flushing_for(cause: usize) {
+    if pending() {
+        FLUSHED_FOR[cause.min(65)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`FLUSHED_FOR`], taken: the causes with most flushes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn flush_causes() -> String {
+    let mut causes: Vec<(u64, usize)> =
+        FLUSHED_FOR.iter().enumerate().map(|(i, n)| (n.swap(0, Ordering::Relaxed), i)).filter(|c| c.0 > 0).collect();
+    causes.sort_unstable_by(|a, b| b.cmp(a));
+    let text: Vec<String> = causes.iter().take(8).map(|(n, i)| format!("{i}: {n}")).collect();
+    text.join(", ")
 }
 
 /// The calls made on this thread from now on come from a stream that
@@ -3362,6 +3403,49 @@ impl State {
             once!(x, "a mesh fallback draw with more than 4 GiB of indices");
             return false;
         };
+        // As an indirect one of one record (`indirect_mesh_fallback_one`):
+        // the mesh program now, the draw at the next flush, when its output
+        // fits a place of the ring.
+        let waits = DEFER.get().0
+            && defers()
+            && at_prims + prims.max(16) <= crate::mesh_indirect::BYTES
+            && !p.stages.iter().any(|s| s.translated().stores || s.shader.probe.is_some() || s.shader.ambient.is_some());
+        if waits && let Some((_, ring)) = crate::host::mesh_ring() {
+            if self.deferred.len() as u32 == crate::host::MESH_RING {
+                #[cfg(feature = "diagnostics")]
+                flushing_for(63);
+                self.flush_deferred(list);
+            }
+            let place = self.deferred.len() as u32;
+            let base = ring + u64::from(place) * crate::mesh_indirect::BYTES;
+            if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+                return false;
+            }
+            // SAFETY: an open list with the compute pass bound; the ring
+            // lives for good.
+            unsafe {
+                for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
+                    list.list.SetComputeRootUnorderedAccessView(param, base + at);
+                }
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
+                list.list.Dispatch(x, 1, 1);
+            }
+            self.deferred.push(Deferred {
+                pipeline: self.pipeline,
+                graphics: self.graphics.clone(),
+                place,
+                bounded: None,
+                groups: x,
+            });
+            DEFER.set((true, true));
+            DEFERRED[0].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        // Drawn at once: after the draws that wait.
+        #[cfg(feature = "diagnostics")]
+        flushing_for(64);
+        self.flush_deferred(list);
         // (At least a little past `u2`'s start, so its address is in the
         // region even when the program has no per-primitive outputs.)
         let Some(region) = list.mesh_scratch(at_prims + prims.max(16), ScratchPool::Data) else {
@@ -3609,6 +3693,8 @@ impl State {
             && !p.stages.iter().any(|s| s.translated().stores || s.shader.probe.is_some() || s.shader.ambient.is_some());
         if waits && let Some((_, ring)) = crate::host::mesh_ring() {
             if self.deferred.len() as u32 == crate::host::MESH_RING {
+                #[cfg(feature = "diagnostics")]
+                flushing_for(63);
                 self.flush_deferred(list);
             }
             let place = self.deferred.len() as u32;
@@ -3630,14 +3716,16 @@ impl State {
                 pipeline: self.pipeline,
                 graphics: self.graphics.clone(),
                 place,
-                bounded: bounded.clone(),
-                at,
+                bounded: Some((bounded.clone(), at)),
+                groups: 0,
             });
             DEFER.set((true, true));
             DEFERRED[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         // Drawn at once: after the draws that wait.
+        #[cfg(feature = "diagnostics")]
+        flushing_for(64);
         self.flush_deferred(list);
         let Some(data) = list.mesh_scratch(regions.bytes, ScratchPool::Data) else {
             return false;
@@ -3692,6 +3780,10 @@ impl State {
         let Some(draw) = (if f.expanded { host_signature(DRAW, 16) } else { host_signature(INDEXED, 20) }) else {
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        if probe("VICTORY_PROBE_NO_MESH_DRAW") {
+            return true;
+        }
         if !self.prepare_for(list, false, true) {
             return false;
         }
@@ -3716,6 +3808,55 @@ impl State {
         // Later draws keep the title's topology.
         self.set_topology(list, self.topology);
         self.drew(list, Some(p));
+        true
+    }
+
+    /// The draw of a direct mesh dispatch of `x` groups that waited: what its
+    /// mesh program wrote at host address `base` (readable there), as
+    /// [`dispatch_mesh_fallback`](Self::dispatch_mesh_fallback) draws it.
+    fn draw_mesh_groups(
+        &mut self,
+        list: &HostList,
+        f: &crate::pipeline::host::MeshFallback,
+        base: u64,
+        x: u32,
+    ) -> bool {
+        let [vertices, indices, _] = f.layout.bytes(x);
+        let aligned = |n: u64| n.next_multiple_of(256);
+        let (at_indices, at_prims) = (aligned(vertices), aligned(vertices) + aligned(indices));
+        let Ok(index_bytes) = u32::try_from(indices) else {
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        if probe("VICTORY_PROBE_NO_MESH_DRAW") {
+            return true;
+        }
+        if !self.prepare_for(list, false, true) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list with the draw bound.
+        unsafe {
+            for (param, at) in f.inputs.into_iter().zip([0, at_indices, at_prims]) {
+                l.SetGraphicsRootShaderResourceView(param, base + at);
+            }
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("mesh {x} drawn"), false));
+            let n = 3 * f.layout.max_primitives * x;
+            if f.expanded {
+                l.DrawInstanced(n, 1, 0, 0);
+            } else {
+                l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: base + at_indices,
+                    SizeInBytes: index_bytes,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                }));
+                l.DrawIndexedInstanced(n, 1, 0, 0, 0);
+            }
+        }
+        // Later draws keep the title's topology.
+        self.set_topology(list, self.topology);
         true
     }
 
@@ -3747,9 +3888,10 @@ impl State {
             self.graphics = d.graphics;
             let base = gpu + u64::from(d.place) * crate::mesh_indirect::BYTES;
             let drawn = match crate::pipeline::host_pipeline(d.pipeline as This) {
-                Some(p) => match &p.fallback {
-                    Some(f) => self.draw_mesh_record(list, p, f, base, (&d.bounded, d.at)),
-                    None => false,
+                Some(p) => match (&p.fallback, &d.bounded) {
+                    (Some(f), Some((bounded, at))) => self.draw_mesh_record(list, p, f, base, (bounded, *at)),
+                    (Some(f), None) => self.draw_mesh_groups(list, f, base, d.groups),
+                    (None, _) => false,
                 },
                 None => false,
             };
@@ -3771,6 +3913,20 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let fallback = crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.fallback.is_some())
+            && mesh_test() != 1
+            && mesh_kept(self.pipeline);
+        // (One drawn without mesh shaders sees to the draws that wait itself.)
+        if !fallback {
+            #[cfg(feature = "diagnostics")]
+            flushing_for(64);
+            self.flush_deferred(list);
+        }
+        #[cfg(feature = "diagnostics")]
+        if fallback && probe("VICTORY_PROBE_NO_MESH") {
+            self.flush_deferred(list);
+            return;
+        }
         if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
             && let Some(f) = &p.fallback
             && mesh_test() != 1
@@ -4593,6 +4749,8 @@ impl State {
         // Mesh draws that wait are drawn before anything but another of
         // them (which `indirect_mesh_fallback_one` decides).
         if !(from_batch && kind == MESH && p.fallback.is_some()) {
+            #[cfg(feature = "diagnostics")]
+            flushing_for(64);
             self.flush_deferred(list);
         }
         // A window of records clamped in one pass (`windows`): for single
@@ -4683,6 +4841,11 @@ impl State {
         if kind == MESH
             && let Some(f) = &p.fallback
         {
+            #[cfg(feature = "diagnostics")]
+            if probe("VICTORY_PROBE_NO_MESH") {
+                self.flush_deferred(list);
+                return true;
+            }
             if from_batch {
                 let ran = self.indirect_mesh_fallback_one(list, p, f, (&bounded, at));
                 if ran {

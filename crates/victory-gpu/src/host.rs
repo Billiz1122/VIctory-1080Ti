@@ -600,6 +600,18 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     retired().push_back((started, Retired::Resource(object)));
 }
 
+/// The number an object let go now waits under ([`retire`]), for what is
+/// kept to be used again instead of dropped ([`buried`]).
+pub(crate) fn retiring() -> u64 {
+    STARTED.load(Ordering::Acquire) + crate::queue::queued()
+}
+
+/// Whether an object let go at `at` ([`retiring`]) would be dropped by now
+/// ([`bury`]): nothing sent to the card, or recorded when it went, uses it.
+pub(crate) fn buried(at: u64) -> bool {
+    at + bury_lag() <= FINISHED.load(Ordering::Acquire)
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -9274,6 +9286,8 @@ impl Meter {
                     waited as f64 / frames,
                     flushes as f64 / frames
                 );
+                #[cfg(feature = "diagnostics")]
+                tracing::info!("  those groups ended, since the last line, for (cause: times): {}", crate::draw::flush_causes());
             }
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
