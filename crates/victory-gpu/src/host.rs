@@ -6706,11 +6706,58 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        let closed = unsafe { self.list.Close() };
+        // `VICTORY_TEST_CLOSE_FAIL=<n>` (diagnostics builds): every n-th list
+        // is taken for one that did not close, to see what a run makes of it.
+        #[cfg(feature = "diagnostics")]
+        let closed = closed.and_then(|()| {
+            static EVERY: OnceLock<u64> = OnceLock::new();
+            static CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let every = *EVERY.get_or_init(|| {
+                std::env::var("VICTORY_TEST_CLOSE_FAIL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            let n = CLOSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if every > 0 && n % every == 0 { Err(windows::Win32::Foundation::E_FAIL.into()) } else { Ok(()) }
+        });
+        if let Err(e) = closed {
+            self.runs_empty(&e);
+        }
+    }
+
+    /// The list did not close: the card's driver (or the runtime) refused
+    /// something recorded into it. The run goes on with the list empty: what
+    /// it would have drawn is missing from one frame, where ending the run
+    /// here took the session with it. It happened once in some fifteen
+    /// runs of ten minutes on a GTX 1080 Ti (trial v2-bary: 0x80004005 with
+    /// the card's memory at 99 % of its budget, in the frame a pipeline was
+    /// first made on demand; the debug layer and a run that made 1,200
+    /// pipelines on demand did not show it again). The steps the list
+    /// deferred to its submission still run, so nothing the title waits for
+    /// is lost. With the debug layer, when the list cannot be emptied, or
+    /// when lists keep failing, the run ends as before.
+    /// shortcut: what the list recorded of our own bookkeeping (resource
+    /// states, texture uploads) is taken for done; a texture uploaded only
+    /// in such a list stays as it was until it is written again.
+    fn runs_empty(&self, e: &windows::core::Error) {
+        /// The most lists a run may lose this way.
+        const MOST: u64 = 32;
+        static EMPTIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = EMPTIED.fetch_add(1, Ordering::Relaxed) + 1;
+        let debug = host().is_some_and(|h| h.messages.is_some());
+        let testing = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_TEST_CLOSE_FAIL").is_some();
+        // SAFETY: a closed list of ours and its allocator; the commands
+        // recorded stay unused in the allocator's memory until its reset.
+        let emptied = unsafe { self.list.Reset(&self.allocator, None).and_then(|()| self.list.Close()) };
+        if debug || emptied.is_err() || (n > MOST && !testing) {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        tracing::error!(
+            error = %e,
+            lists = n,
+            "a host command list did not close: it runs empty, and its part of this frame is missing"
+        );
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
