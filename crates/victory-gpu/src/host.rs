@@ -2463,6 +2463,38 @@ static MESH_SPARE: Mutex<Spare<MeshChunk>> = Mutex::new(Spare::new());
 /// The most bytes of [`MESH_SPARE`]; the rest are let go.
 const MESH_SPARE_MOST: u64 = 256 << 20;
 
+/// How many mesh fallback draws wait for one flush at most
+/// (`crate::draw::State::flush_deferred`): the places of [`mesh_ring`].
+pub(crate) const MESH_RING: u32 = 16;
+
+struct MeshRing(ID3D12Resource, u64);
+
+// SAFETY: a D3D12 resource (free-threaded) and its address.
+unsafe impl Send for MeshRing {}
+// SAFETY: as above.
+unsafe impl Sync for MeshRing {}
+
+/// The memory the mesh programs of draws that wait for their flush write:
+/// [`MESH_RING`] places of `crate::mesh_indirect::BYTES`, and its address.
+/// One buffer for every list: a list's commands run one after another and
+/// one list after another on the drawing queue, and what a place holds is
+/// read by the flush that follows its writing, so the next group of draws,
+/// of this list or another, starts at the first place again. It rests in
+/// UNORDERED_ACCESS between groups (out of COMMON by itself at the first use
+/// of a submission, where buffers decay to).
+pub(crate) fn mesh_ring() -> Option<(&'static ID3D12Resource, u64)> {
+    static RING: OnceLock<Option<MeshRing>> = OnceLock::new();
+    RING.get_or_init(|| {
+        let buffer = host()?.uav_buffer(u64::from(MESH_RING) * crate::mesh_indirect::BYTES)?;
+        name(&buffer, || "mesh fallback ring".to_owned());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(MeshRing(buffer, gpu))
+    })
+    .as_ref()
+    .map(|r| (&r.0, r.1))
+}
+
 /// A kept mesh fallback chunk of `size` bytes ([`MESH_SPARE`]), if any.
 fn take_mesh_chunk(size: u64) -> Option<ID3D12Resource> {
     MESH_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size).map(|MeshChunk(buffer)| buffer)
@@ -9188,6 +9220,14 @@ impl Meter {
             tracing::info!(
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
+            let (waited, flushes) = crate::draw::deferred_counts();
+            if waited > 0 {
+                tracing::info!(
+                    "mesh draws without mesh shaders per frame: {:.0} drawn after their mesh programs in {:.0} groups (VICTORY_MESH_DEFER=0: each right after its own)",
+                    waited as f64 / frames,
+                    flushes as f64 / frames
+                );
+            }
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);

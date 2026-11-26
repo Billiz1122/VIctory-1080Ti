@@ -701,6 +701,11 @@ extern "system" fn copy_texture_region_x(
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    // Mesh draws without mesh shaders may wait for the draws after them
+    // (`State::flush_deferred`): they are drawn before every call that is
+    // not only a setting, and before the stream's end.
+    let flush = || super::with_state(list, |host, state| state.flush_deferred(host));
+    let was = crate::draw::deferring(true);
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -708,6 +713,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         calls += 1;
         if calls % 64 == 0 {
             skip = left();
+        }
+        if !only_sets(op) && crate::draw::pending() {
+            flush();
         }
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
@@ -808,7 +816,29 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             _ => {}
         }
     }
+    if crate::draw::pending() {
+        flush();
+    }
+    crate::draw::deferring(was);
     (calls, closed)
+}
+
+/// The calls that only set what later draws and dispatches are bound with
+/// (and indirect executions, which see to waiting mesh draws themselves):
+/// mesh draws that wait for their flush wait across them.
+fn only_sets(op: u64) -> bool {
+    const SETS: [u64; 9] = [
+        Plain::COMPUTE_TABLE as u64,
+        Plain::GRAPHICS_TABLE as u64,
+        Plain::COMPUTE_CONSTANT as u64,
+        Plain::GRAPHICS_CONSTANT as u64,
+        Plain::COMPUTE_VIEW as u64,
+        Plain::GRAPHICS_VIEW as u64,
+        Plain::SET_PIPELINE as u64,
+        Plain::EXECUTE_INDIRECT as u64,
+        UPLOAD,
+    ];
+    SETS.contains(&op) || op == COMPUTE_CONSTANTS || op == GRAPHICS_CONSTANTS
 }
 
 /// The table of a list whose calls are written down: that of the others with

@@ -154,6 +154,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Whether the calls being made come from a stream that flushes waiting
+    /// mesh draws where it must ([`deferring`]), and whether any wait.
+    static DEFER: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -438,6 +441,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Mesh draws whose mesh programs have run (as compute) and whose draws
+    /// wait for [`State::flush_deferred`], in order.
+    deferred: Vec<Deferred>,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
@@ -560,6 +566,46 @@ pub(crate) fn dropped_now() -> u64 {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+/// A mesh draw without mesh shaders that waits for its flush: what the
+/// title had set for it, the place of [`crate::host::mesh_ring`] its mesh
+/// program wrote, and where its draw's arguments are.
+struct Deferred {
+    pipeline: usize,
+    graphics: Vec<Root>,
+    place: u32,
+    bounded: ID3D12Resource,
+    at: u64,
+}
+
+/// `VICTORY_MESH_DEFER=0`: every mesh draw without mesh shaders is drawn
+/// right after its mesh program, as before.
+fn defers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_DEFER").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: mesh draws that waited for a flush, and flushes.
+static DEFERRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`DEFERRED`], taken.
+pub(crate) fn deferred_counts() -> (u64, u64) {
+    (DEFERRED[0].swap(0, Ordering::Relaxed), DEFERRED[1].swap(0, Ordering::Relaxed))
+}
+
+/// The calls made on this thread from now on come from a stream that
+/// flushes waiting mesh draws before every call that is not only a setting
+/// (`crate::list::thin`): mesh draws may wait. Returns what it was.
+pub(crate) fn deferring(on: bool) -> bool {
+    let was = DEFER.get();
+    DEFER.set((on, was.1));
+    was.0
+}
+
+/// Whether mesh draws of this thread's stream wait for their flush.
+pub(crate) fn pending() -> bool {
+    DEFER.get().1
+}
+
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -3541,27 +3587,64 @@ impl State {
         f: &crate::pipeline::host::MeshFallback,
         (bounded, at): (&ID3D12Resource, u64),
     ) -> bool {
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         let regions = crate::mesh_indirect::regions(&f.layout);
-        let Ok(index_bytes) = u32::try_from(regions.index_bytes) else {
+        let Some(dispatch) = host_signature(DISPATCH, 12) else {
             return false;
         };
-        let draw = if f.expanded { host_signature(DRAW, 16) } else { host_signature(INDEXED, 20) };
-        let (Some(dispatch), Some(draw)) = (host_signature(DISPATCH, 12), draw) else {
-            return false;
-        };
+        let (uav, read) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        );
+        let places = [0, regions.indices, regions.prims];
+        // The mesh program now, the draw at the next flush with those of the
+        // mesh draws around it: the card took 18 us for each command that
+        // changed between a compute pass and a draw (trial v2-timing), and
+        // the two transitions around every draw go too. Not for a pipeline
+        // whose shaders store to buffers or are followed by a pass of ours:
+        // later mesh programs must not run before such a draw.
+        let waits = DEFER.get().0
+            && defers()
+            && regions.bytes <= crate::mesh_indirect::BYTES
+            && !p.stages.iter().any(|s| s.translated().stores || s.shader.probe.is_some() || s.shader.ambient.is_some());
+        if waits && let Some((_, ring)) = crate::host::mesh_ring() {
+            if self.deferred.len() as u32 == crate::host::MESH_RING {
+                self.flush_deferred(list);
+            }
+            let place = self.deferred.len() as u32;
+            let base = ring + u64::from(place) * crate::mesh_indirect::BYTES;
+            if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+                return false;
+            }
+            // SAFETY: an open list with the compute pass bound; the batch's
+            // buffer is the list's, the ring lives for good.
+            unsafe {
+                for (param, place) in f.outputs.into_iter().zip(places) {
+                    list.list.SetComputeRootUnorderedAccessView(param, base + place);
+                }
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text("indirect mesh 1 as compute".to_owned(), false));
+                list.list.ExecuteIndirect(&dispatch, 1, bounded, at, None, 0);
+            }
+            self.deferred.push(Deferred {
+                pipeline: self.pipeline,
+                graphics: self.graphics.clone(),
+                place,
+                bounded: bounded.clone(),
+                at,
+            });
+            DEFER.set((true, true));
+            DEFERRED[0].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        // Drawn at once: after the draws that wait.
+        self.flush_deferred(list);
         let Some(data) = list.mesh_scratch(regions.bytes, ScratchPool::Data) else {
             return false;
         };
         let buffer = &data.buffer;
         list.keep(buffer);
         let l = &list.list;
-        let (uav, read) = (
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
-        );
         if data.first {
             // SAFETY: an open list and a live buffer.
             unsafe { l.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
@@ -3571,7 +3654,6 @@ impl State {
         }
         // SAFETY: the buffer lives until the list is reset.
         let base = unsafe { buffer.GetGPUVirtualAddress() } + data.offset;
-        let places = [0, regions.indices, regions.prims];
         // SAFETY: an open list with the compute pass bound; the batch's
         // buffer is the list's.
         unsafe {
@@ -3583,34 +3665,104 @@ impl State {
             l.ExecuteIndirect(&dispatch, 1, bounded, at, None, 0);
             l.ResourceBarrier(&[transition(buffer, uav, read)]);
         }
-        let drawn = self.prepare_for(list, false, true);
-        if drawn {
-            // SAFETY: an open list with the draw bound.
-            unsafe {
-                for (param, place) in f.inputs.into_iter().zip(places) {
-                    l.SetGraphicsRootShaderResourceView(param, base + place);
-                }
-                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
-                if !f.expanded {
-                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                        BufferLocation: base + regions.indices,
-                        SizeInBytes: index_bytes,
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                    }));
-                }
-                #[cfg(feature = "diagnostics")]
-                list.note_op(|| self.op_text("indirect mesh 1 drawn".to_owned(), false));
-                l.ExecuteIndirect(&draw, 1, bounded, at + crate::indirect::batch::DRAW_AT, None, 0);
-            }
-            self.set_topology(list, self.topology);
-        }
+        let drawn = self.draw_mesh_record(list, p, f, base, (bounded, at));
         // SAFETY: an open list; the chunk is back in UNORDERED_ACCESS for the
         // list's next draws.
         unsafe { l.ResourceBarrier(&[transition(buffer, read, uav)]) };
-        if drawn {
-            self.drew(list, Some(p));
-        }
         drawn
+    }
+
+    /// The draw of [`indirect_mesh_fallback_one`](Self::indirect_mesh_fallback_one):
+    /// what the mesh program wrote at host address `base` (readable there),
+    /// with the draw's arguments behind the record at `at` of `bounded`.
+    fn draw_mesh_record(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        base: u64,
+        (bounded, at): (&ID3D12Resource, u64),
+    ) -> bool {
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        let regions = crate::mesh_indirect::regions(&f.layout);
+        let Ok(index_bytes) = u32::try_from(regions.index_bytes) else {
+            return false;
+        };
+        let Some(draw) = (if f.expanded { host_signature(DRAW, 16) } else { host_signature(INDEXED, 20) }) else {
+            return false;
+        };
+        if !self.prepare_for(list, false, true) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list with the draw bound.
+        unsafe {
+            for (param, place) in f.inputs.into_iter().zip([0, regions.indices, regions.prims]) {
+                l.SetGraphicsRootShaderResourceView(param, base + place);
+            }
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+            if !f.expanded {
+                l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: base + regions.indices,
+                    SizeInBytes: index_bytes,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                }));
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text("indirect mesh 1 drawn".to_owned(), false));
+            l.ExecuteIndirect(&draw, 1, bounded, at + crate::indirect::batch::DRAW_AT, None, 0);
+        }
+        // Later draws keep the title's topology.
+        self.set_topology(list, self.topology);
+        self.drew(list, Some(p));
+        true
+    }
+
+    /// Draws the mesh draws that wait ([`Deferred`]), in their order, each
+    /// with what the title had set for it: before any call that is not only
+    /// a setting (`crate::list::thin`), and before a mesh draw that does not
+    /// wait. Their mesh programs have all run by then, so the ring moves to
+    /// its reading states once for all of them and back once.
+    pub(crate) fn flush_deferred(&mut self, list: &HostList) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let waiting = std::mem::take(&mut self.deferred);
+        let was = DEFER.get();
+        DEFER.set((was.0, false));
+        DEFERRED[1].fetch_add(1, Ordering::Relaxed);
+        let Some((ring, gpu)) = crate::host::mesh_ring() else {
+            return;
+        };
+        let (uav, read) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        );
+        // SAFETY: an open list and a buffer that lives for good.
+        unsafe { list.list.ResourceBarrier(&[transition(ring, uav, read)]) };
+        let (pipeline, graphics) = (self.pipeline, std::mem::take(&mut self.graphics));
+        for d in waiting {
+            self.pipeline = d.pipeline;
+            self.graphics = d.graphics;
+            let base = gpu + u64::from(d.place) * crate::mesh_indirect::BYTES;
+            let drawn = match crate::pipeline::host_pipeline(d.pipeline as This) {
+                Some(p) => match &p.fallback {
+                    Some(f) => self.draw_mesh_record(list, p, f, base, (&d.bounded, d.at)),
+                    None => false,
+                },
+                None => false,
+            };
+            if !drawn {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(d.pipeline);
+            }
+        }
+        self.pipeline = pipeline;
+        self.graphics = graphics;
+        // SAFETY: as above.
+        unsafe { list.list.ResourceBarrier(&[transition(ring, read, uav)]) };
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -4437,6 +4589,11 @@ impl State {
         let from_batch = batch.is_some();
         if from_batch {
             self.window = None;
+        }
+        // Mesh draws that wait are drawn before anything but another of
+        // them (which `indirect_mesh_fallback_one` decides).
+        if !(from_batch && kind == MESH && p.fallback.is_some()) {
+            self.flush_deferred(list);
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
