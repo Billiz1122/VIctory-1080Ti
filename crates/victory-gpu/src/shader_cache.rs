@@ -174,10 +174,45 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
         None => translate(container),
+    }?;
+    // A pixel shader that reads barycentrics on a host without them (a GTX
+    // 1080 Ti): translated again to read inputs of its own in their place,
+    // which a mesh pipeline drawn without mesh shaders writes
+    // (`victory_shader::emit::emulated_vertex_shader`). An entry of its
+    // own; no other shader's translation changes. One that does not come
+    // out that way stays as it was, and its pipelines are refused as before.
+    // (`VICTORY_BARYCENTRICS_EMULATED=0`: not; such pipelines are refused.)
+    const BARYCENTRICS: u64 = 0x2_0000;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_BARYCENTRICS_EMULATED").is_none_or(|v| v != "0"))
+        && shader.stage == HwStage::Ps
+        && victory_shader::emit::required_features(&shader.dxil) & BARYCENTRICS != 0
+        && crate::host::host().is_some_and(|h| !h.barycentrics())
+    {
+        let again = |c: &[u8]| victory_shader::emit::translate_emulating_barycentrics(c).map_err(|e| e.to_string());
+        let emulated = match CACHE.get() {
+            Some(cache) => {
+                let mut key = blake3::Hasher::new();
+                key.update(&build());
+                key.update(b"barycentrics emulated");
+                cached(cache, key.finalize().as_bytes(), container, again, refresh_in_runs())
+            }
+            None => again(container),
+        };
+        match emulated {
+            Ok(emulated) => return Ok(emulated),
+            Err(error) => {
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error, "a pixel shader that reads barycentrics does not translate without them (logged once)");
+                }
+            }
+        }
     }
+    Ok(shader)
 }
 
 /// A container's mesh program run as compute (hosts without mesh shaders),

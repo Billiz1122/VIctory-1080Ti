@@ -1587,6 +1587,40 @@ pub(super) fn with_mask_ops_on_numbers<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+thread_local! {
+    /// See [`with_emulated_barycentrics`].
+    static EMULATED_BARYCENTRICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The semantics of the inputs a pixel program reads in place of
+/// barycentrics ([`with_emulated_barycentrics`]): the weights, and an
+/// element's values at the triangle's second and third vertex (their
+/// semantic index is the element's register row times four plus its
+/// first column).
+pub(crate) const EMULATED: [&str; 3] = ["VBARY", "VATA", "VATB"];
+
+/// Runs `translate` for a host without barycentrics (`SV_Barycentrics` and
+/// `GetAttributeAtVertex`; a GTX 1080 Ti has neither): a pixel program
+/// reads the weights from an input of its own that the stage before it
+/// writes as (1,0,0), (0,1,0) and (0,0,1) at a triangle's vertices, which
+/// interpolates to the same weights, and an element's values at the second
+/// and third vertex from two constant inputs (the first vertex is the
+/// provoking one: the element itself, constant). The stage before must
+/// write them, with three vertices of its own per triangle
+/// ([`super::mesh_vs`]). Only for programs that set the barycentrics flag
+/// otherwise: no other program changes.
+pub(super) fn with_emulated_barycentrics<R>(translate: impl FnOnce() -> R) -> R {
+    let before = EMULATED_BARYCENTRICS.replace(true);
+    let result = translate();
+    EMULATED_BARYCENTRICS.set(before);
+    result
+}
+
+/// Whether [`with_emulated_barycentrics`] is running the translation.
+pub(super) fn emulated_barycentrics() -> bool {
+    EMULATED_BARYCENTRICS.get()
+}
+
 pub(super) fn host_max_wave() -> u32 {
     THREAD_MAX_WAVE
         .get()
@@ -3174,6 +3208,34 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
+        if EMULATED_BARYCENTRICS.get() {
+            // One input of our own per interpolation mode, which the stage
+            // before writes ([`with_emulated_barycentrics`]).
+            let own = |e: &SigElement| e.kind == 0 && e.name == EMULATED[0];
+            let id = match self.s.inputs.iter().position(|e| own(e) && e.interp == mode) {
+                Some(id) => id,
+                None => {
+                    let Some(row) = self.spare_input_row() else {
+                        return Val::Missing("no register left for emulated barycentrics");
+                    };
+                    let index = self.s.inputs.iter().filter(|e| own(e)).count() as u32;
+                    self.s.inputs.push(SigElement {
+                        name: EMULATED[0].into(),
+                        index,
+                        kind: 0,
+                        comp: 9,
+                        interp: mode,
+                        row: Some(row),
+                        col: 0,
+                        cols: 3,
+                        usage: 0,
+                        half: false,
+                    });
+                    self.s.inputs.len() - 1
+                }
+            };
+            return self.load_any_input(id, index + 1);
+        }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
         let bary = |e: &SigElement| e.kind == 28;
@@ -3214,6 +3276,13 @@ impl<'a> Lower<'a> {
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
+    }
+
+    /// The highest input register no element has
+    /// ([`with_emulated_barycentrics`]: its inputs go there, away from the
+    /// rows the stage before writes for the title's own).
+    fn spare_input_row(&self) -> Option<u32> {
+        (0..32).rev().find(|&row| self.s.inputs.iter().all(|e| e.row != Some(row)))
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -11376,12 +11445,12 @@ impl<'a> Lower<'a> {
                 _ => Err("an input"),
             };
         };
-        let v0 = self.vertex_input(id, col, 0);
+        let v0 = self.vertex_input(id, col, 0)?;
         let c = self.cur;
         let mut acc = p0.then_some(v0);
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
-            let vk = self.vertex_input(id, col, k);
+            let vk = self.vertex_input(id, col, k)?;
             let d = self.s.m.bin(c, Bin::Sub, vk, v0);
             acc = Some(match acc {
                 Some(a) => self.fmad(w, d, a),
@@ -11392,9 +11461,49 @@ impl<'a> Lower<'a> {
         Ok(self.as_int(acc))
     }
 
+    /// The input of our own that holds element `id` at the triangle's
+    /// vertex `k` (1 or 2), declared on first use; `None` if no register is
+    /// left ([`with_emulated_barycentrics`]).
+    fn other_vertex_input(&mut self, id: usize, k: u8) -> Option<usize> {
+        let e = &self.s.inputs[id];
+        let (name, index) = (EMULATED[usize::from(k)], e.row? * 4 + u32::from(e.col));
+        if let Some(at) = self.s.inputs.iter().position(|o| o.kind == 0 && o.name == name && o.index == index) {
+            return Some(at);
+        }
+        let (comp, cols) = (e.comp, e.cols);
+        let row = self.spare_input_row()?;
+        self.s.inputs.push(SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp,
+            interp: 1,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        });
+        Some(self.s.inputs.len() - 1)
+    }
+
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
-    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> Result<V, Why> {
+        if EMULATED_BARYCENTRICS.get() {
+            // The provoking vertex's is the constant element itself; the
+            // other two come in inputs of our own, constant too
+            // ([`with_emulated_barycentrics`]).
+            let from = match k {
+                0 => id,
+                _ => self.other_vertex_input(id, k).ok_or("no register left for an input at a vertex")?,
+            };
+            let entry = self.s.entry;
+            return match self.load_any_input(from, col) {
+                Val::I32(x) => Ok(self.s.m.cast(entry, Cast::Bitcast, x, self.s.t.f32)),
+                _ => Err("an input"),
+            };
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -11419,11 +11528,11 @@ impl<'a> Lower<'a> {
             137,
             &args,
         );
-        if int {
+        Ok(if int {
             self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
         } else {
             v
-        }
+        })
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit

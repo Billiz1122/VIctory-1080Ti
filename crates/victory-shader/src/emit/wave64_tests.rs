@@ -268,6 +268,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered.expect("lower");
@@ -1185,6 +1186,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_as_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered.unwrap_or_else(|e| panic!("lower: {e}"));
@@ -1301,6 +1303,7 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_as_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     lowered.expect("lower").wave_size

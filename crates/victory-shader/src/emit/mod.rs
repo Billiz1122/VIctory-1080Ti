@@ -600,6 +600,88 @@ pub fn emit_mesh_as_compute(
     })
 }
 
+/// [`translate`] for a host without barycentrics (`SV_Barycentrics`,
+/// `GetAttributeAtVertex`): a pixel program reads inputs of its own in
+/// their place, which [`emulated_vertex_shader`] writes. For a program
+/// whose plain translation asks for the feature
+/// ([`required_features`] bit 0x2_0000); any other comes out the same.
+pub fn translate_emulating_barycentrics(container: &[u8]) -> Result<HostShader, ShaderError> {
+    lower::with_emulated_barycentrics(|| translate(container))
+}
+
+/// The inputs a translated pixel shader reads in place of barycentrics
+/// ([`translate_emulating_barycentrics`]); none for any other shader.
+fn emulated_inputs(pixel: &[u8]) -> Vec<container::SigElement> {
+    let read = || -> Option<Vec<container::SigElement>> {
+        let c = Container::parse(pixel).ok()?;
+        signature(c.part(FourCC::ISG1)?.data).ok()
+    };
+    let mut inputs = read().unwrap_or_default();
+    inputs.retain(|e| e.kind == 0 && lower::EMULATED.contains(&e.name.as_str()));
+    inputs
+}
+
+/// Whether a translated pixel shader reads inputs in place of barycentrics:
+/// only a pipeline whose vertices [`emulated_vertex_shader`] writes can
+/// run it.
+pub fn emulates_barycentrics(pixel: &[u8]) -> bool {
+    !emulated_inputs(pixel).is_empty()
+}
+
+/// The vertex shader that draws `fallback` (of the mesh program in the
+/// console container `mesh`) for the translated pixel shader `pixel`, if
+/// that reads inputs in place of barycentrics: it writes them too, and is
+/// drawn as an [expanded](MeshFallback::expanded) one, three vertices a
+/// primitive. `None`: the fallback's own vertex shader serves. An error:
+/// the pair cannot be drawn.
+pub fn emulated_vertex_shader(
+    mesh: &[u8],
+    fallback: &MeshFallback,
+    pixel: &[u8],
+) -> Option<Result<HostShader, &'static str>> {
+    let mut emulated = emulated_inputs(pixel);
+    if emulated.is_empty() {
+        return None;
+    }
+    for e in &mut emulated {
+        e.interp = if e.name == lower::EMULATED[0] { 2 } else { 1 };
+    }
+    // The mesh program's outputs as `emit_with` declares them: the records
+    // the compute form writes are in this order.
+    let outputs = || -> Result<_, ShaderError> {
+        let c = Container::parse(mesh)?;
+        let sig = |fourcc| c.part(fourcc).map_or(Ok(Vec::new()), |p| signature(p.data));
+        let mut outputs = sig(FourCC::OSG1)?;
+        for e in &mut outputs {
+            e.interp = match (e.kind, e.comp) {
+                (3, _) => 4,
+                (13, _) => 1,
+                (28, _) => 2,
+                (0 | 6 | 7, 9) => 2,
+                (0, _) => 1,
+                _ => 0,
+            };
+        }
+        let mut prims = sig(FourCC::PSG1)?;
+        prims.retain(|e| !matches!(e.kind, 10 | 30));
+        for e in &mut prims {
+            e.interp = 1;
+        }
+        Ok((outputs, prims))
+    };
+    let Ok((outputs, prims)) = outputs() else {
+        return Some(Err("the mesh program's signature does not parse"));
+    };
+    let layout = &fallback.layout;
+    if 4 * outputs.len() as u32 != layout.vertex_dwords || 4 * prims.len() as u32 != layout.primitive_dwords {
+        return Some(Err("the mesh program's signature is not its fallback's"));
+    }
+    Some(
+        mesh_vs::vertex_shader_with(&outputs, &prims, layout.vertex_dwords, layout.primitive_dwords, &emulated)
+            .map(|dxil| HostShader { dxil, ..fallback.vertex.clone() }),
+    )
+}
+
 /// The vertex shader of a [`MeshFallback`].
 fn fallback_vertex_shader(
     outputs: &[container::SigElement],
@@ -995,6 +1077,12 @@ fn emit_with(
     };
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
+    // For a host without barycentrics the console's own element goes: the
+    // weights are read from an input of ours (before any element is loaded
+    // by its place in the signature).
+    if pixel && lower::emulated_barycentrics() {
+        inputs.retain(|e| e.kind != 28);
+    }
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
@@ -2551,6 +2639,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_as_compute: false,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2679,6 +2768,7 @@ mod tests {
                 outputs: Vec::new(),
                 prims: Vec::new(),
                 mesh_stride: 0,
+                mesh_as_compute: false,
             })
             .unwrap();
             super::shader::CONSTANTS_RAW_HERE.set(None);
@@ -3342,6 +3432,186 @@ mod barycentric_tests {
         }
         if ran == 0 {
             eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
+    /// For a host without barycentrics the weights are an input of the
+    /// program's own, on the highest register, and nothing asks for the
+    /// feature.
+    #[test]
+    fn emulated_barycentrics_are_an_input_of_the_programs_own() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let shader = lower::with_emulated_barycentrics(|| pixel(&words, PERSP_CENTER)).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0, "asks for the feature");
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        let own: Vec<_> = inputs.iter().filter(|e| e.name == "VBARY").collect();
+        assert_eq!(own.len(), 1, "{inputs:?}");
+        assert_eq!((own[0].kind, own[0].index, own[0].row, own[0].col, own[0].cols), (0, 0, Some(31), 0, 3));
+        assert!(super::emulates_barycentrics(&shader.dxil));
+        // The plain translation reads none of ours.
+        assert!(!super::emulates_barycentrics(&pixel(&words, PERSP_CENTER).unwrap().dxil));
+        validate(&shader);
+    }
+
+    /// The fallback's vertex shader writes those inputs at the registers
+    /// the pixel shader has them, and refuses one of an element the mesh
+    /// program does not write.
+    #[test]
+    fn the_fallback_vertex_shader_writes_emulated_inputs() {
+        let outputs = [element("SV_Position", 3, 0), element("TEXCOORD", 0, 1)];
+        let mut weights = element("VBARY", 0, 31);
+        weights.cols = 3;
+        let other = |name: &str, row: u32, of_row: u32| {
+            let mut e = element(name, 0, row);
+            e.index = of_row * 4;
+            e
+        };
+        let emulated = [weights, other("VATA", 30, 1), other("VATB", 29, 1)];
+        let dxil = super::mesh_vs::vertex_shader_with(&outputs, &[], 8, 0, &emulated).unwrap();
+        let c = Container::parse(&dxil).unwrap();
+        let written = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        for e in &emulated {
+            let w = written.iter().find(|w| w.name == e.name).unwrap_or_else(|| panic!("{} is not written: {written:?}", e.name));
+            assert_eq!((w.index, w.row, w.col, w.cols), (e.index, e.row, e.col, e.cols));
+        }
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
+        // Row 9 is no output of the mesh program; row 1 is taken.
+        assert!(super::mesh_vs::vertex_shader_with(&outputs, &[], 8, 0, &[other("VATA", 30, 9)]).is_err());
+        assert!(super::mesh_vs::vertex_shader_with(&outputs, &[], 8, 0, &[other("VATA", 1, 1)]).is_err());
+        // Without them it is the fallback's own, drawn by index.
+        assert_eq!(
+            super::mesh_vs::vertex_shader_with(&outputs, &[], 8, 0, &[]).unwrap(),
+            super::mesh_vs::vertex_shader(&outputs, &[], 8, 0)
+        );
+    }
+
+    /// What a pixel program reads in place of barycentrics gives it the same
+    /// values: the test of `first_half_values_render_on_hardware_and_warp`,
+    /// on hosts with or without the feature (a GTX 1080 Ti has none), with a
+    /// vertex shader that writes the inputs as the fallback's does.
+    #[test]
+    #[cfg(windows)]
+    fn emulated_barycentrics_render_on_hardware_and_warp() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for paired in [false, true] {
+            let ps = lower::with_emulated_barycentrics(|| first_half_pixel(paired));
+            validate(&ps);
+            let (features, inputs) = parts(&ps);
+            assert_eq!(features & 0x2_0000, 0, "asks for the feature");
+            assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+            assert!(inputs.iter().any(|e| e.name == "VATA"), "{inputs:?}");
+            // The position, then one vertex element for each of the pixel
+            // shader's inputs, passed through to the register it has it on.
+            let mut s = Shader::new(false);
+            s.inputs = vec![element("POSITION", 0, 0)];
+            for k in 0..inputs.len() as u32 {
+                let mut e = element("PASSED", 0, 1 + k);
+                e.index = k;
+                s.inputs.push(e);
+            }
+            for e in &mut s.inputs {
+                e.usage = 15;
+            }
+            s.outputs = inputs.clone();
+            for e in &mut s.outputs {
+                e.usage = (1 << e.cols) - 1;
+                e.interp = 2;
+            }
+            let mut position = element("SV_Position", 3, 1);
+            position.usage = 15;
+            position.interp = 4;
+            s.outputs.push(position);
+            for (k, e) in inputs.iter().enumerate() {
+                for col in 0..e.cols {
+                    let args = [s.m.i32(1 + k as u32), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                    let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                    let args = [s.m.i32(k as u32), s.m.i32(0), s.m.i8(col), v];
+                    s.op(s.entry, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+                }
+            }
+            for col in 0..4 {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(inputs.len() as u32), s.m.i32(0), s.m.i8(col), v];
+                s.op(s.entry, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            s.m.terminate(s.entry, Term::Ret);
+            let vs = HostShader {
+                stage: HwStage::Vs,
+                dxil: s.finish(),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+            };
+            validate(&vs);
+            // One triangle covers an 8x8 target, with attribute values 2, 6
+            // and 10 at its vertices: each vertex has its own, its weight,
+            // and the second and third vertex's.
+            let positions = [[-1.0f32, 1.0, 0.5, 1.0], [-1.0, -3.0, 0.5, 1.0], [3.0, 1.0, 0.5, 1.0]];
+            let values = [2.0f32, 6.0, 10.0];
+            let mut vertices: Vec<f32> = Vec::new();
+            for corner in 0..3 {
+                vertices.extend(positions[corner]);
+                for e in &inputs {
+                    let mut four = [0.0f32; 4];
+                    match e.name.as_str() {
+                        "TEXCOORD" => four[0] = values[corner],
+                        "VBARY" => four[corner] = 1.0,
+                        "VATA" => four[0] = values[1],
+                        "VATB" => four[0] = values[2],
+                        other => panic!("an input of the pixel shader that is not known: {other}"),
+                    }
+                    vertices.extend(four);
+                }
+            }
+            for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                let Ok(host) = Host::new(warp) else { continue };
+                let (root, pso) = host.pipeline(&vs, &ps).expect("emulated interpolation pipeline");
+                let out = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: (16 + 16 * inputs.len()) as u32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .expect("draw emulated interpolation");
+                for (n, texel) in out.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let partial = 2.0 + i * 4.0;
+                    let want = if paired { partial + 2.0 + i * 4.0 + j * 8.0 } else { partial };
+                    for &got in texel {
+                        assert!((got - want).abs() < 1e-4, "{backend} paired={paired} pixel={n}: got {got}, want {want}");
+                    }
+                }
+                ran += 1;
+                eprintln!("emulated barycentrics render correctly on {backend} (paired {paired})");
+            }
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host; GPU checks skipped");
         }
     }
 

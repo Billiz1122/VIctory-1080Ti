@@ -474,7 +474,17 @@ impl HostPipeline {
                 let Some(f) = ms.mesh_fallback() else {
                     return refuse("the mesh shader does not translate as compute", shaders);
                 };
-                let vertex = &f.vertex;
+                // A pixel shader translated for this host without barycentrics
+                // reads inputs of its own, which a vertex shader of the pair's
+                // writes: three vertices of its own a primitive.
+                let emulated = find("pixel")
+                    .and_then(|ps| ps.translated())
+                    .and_then(|t| victory_shader::emit::emulated_vertex_shader(&ms.container, f, &t.host.dxil));
+                let (vertex, expanded) = match emulated {
+                    None => (std::borrow::Cow::Borrowed(&f.vertex), f.expanded),
+                    Some(Ok(vertex)) => (std::borrow::Cow::Owned(vertex), true),
+                    Some(Err(why)) => return refuse(why, shaders),
+                };
                 let t = &ms.translated()?.host;
                 let c = &f.compute;
                 if c.user_data != t.user_data
@@ -487,7 +497,7 @@ impl HostPipeline {
                         shaders,
                     );
                 }
-                Some((f, vertex))
+                Some((f, vertex, expanded))
             }
             _ => None,
         };
@@ -519,7 +529,7 @@ impl HostPipeline {
         let lanes = victory_shader::emit::host_max_wave();
         let too_wide = |dxil: &[u8]| victory_shader::emit::required_wave(dxil).is_some_and(|w| w > lanes);
         if stages.iter().any(|(s, _)| s.translated().is_some_and(|t| too_wide(&t.host.dxil)))
-            || fallback.as_ref().is_some_and(|(f, _)| too_wide(&f.compute.dxil))
+            || fallback.as_ref().is_some_and(|(f, _, _)| too_wide(&f.compute.dxil))
         {
             return refuse("a shader needs waves wider than the host's", shaders);
         }
@@ -532,6 +542,13 @@ impl HostPipeline {
             })
         {
             return refuse("a pixel shader reads barycentrics, which the host lacks", shaders);
+        }
+        // One translated to read inputs of its own instead: only the vertex
+        // shader of a mesh pipeline drawn without mesh shaders writes them.
+        if fallback.is_none()
+            && stages.iter().any(|(s, _)| s.translated().is_some_and(|t| victory_shader::emit::emulates_barycentrics(&t.host.dxil)))
+        {
+            return refuse("a pixel shader reads barycentrics, which the host lacks (no mesh pipeline to emulate them in)", shaders);
         }
         let host = host()?;
 
@@ -785,7 +802,7 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if let (Some((f, vertex)), Some((outputs, inputs))) = (fallback, fallback_params) {
+        if let (Some((f, vertex, expanded)), Some((outputs, inputs))) = (fallback, fallback_params) {
             let bytes = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr().cast(),
                 BytecodeLength: dxil.len(),
@@ -852,7 +869,7 @@ impl HostPipeline {
             tracing::info!(
                 ?shaders,
                 layout = ?f.layout,
-                expanded = f.expanded,
+                expanded,
                 "host mesh pipeline, run as compute"
             );
             crate::host::name(&pso, || format!("{shaders:?} fallback"));
@@ -862,7 +879,7 @@ impl HostPipeline {
                 &root,
                 outputs,
                 inputs[0],
-                f.expanded,
+                expanded,
             );
             if let Err(e) = &signatures {
                 tracing::warn!(error = %e, ?shaders, "no mesh fallback command signatures");
@@ -876,7 +893,7 @@ impl HostPipeline {
                     layout: f.layout,
                     outputs,
                     inputs,
-                    expanded: f.expanded,
+                    expanded,
                     signatures,
                 }),
                 pso,
