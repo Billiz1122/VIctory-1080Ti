@@ -11461,17 +11461,22 @@ impl<'a> Lower<'a> {
         Ok(self.as_int(acc))
     }
 
-    /// The input of our own that holds element `id` at the triangle's
-    /// vertex `k` (1 or 2), declared on first use; `None` if no register is
-    /// left ([`with_emulated_barycentrics`]).
-    fn other_vertex_input(&mut self, id: usize, k: u8) -> Option<usize> {
+    /// The input of our own that holds column `col` of element `id` at the
+    /// triangle's vertex `k` (1 or 2), declared on first use; `None` if no
+    /// register is left ([`with_emulated_barycentrics`]). One column each,
+    /// four to a register: the pixel shader of people's skin and clothes
+    /// reads 28 columns of nine elements at the vertices, and an input of
+    /// all of an element's columns, read or not, in a register of its own
+    /// was 18 registers where 16 are spare (28 pixel shaders did not
+    /// translate, 91 draws a frame in the prologue's cell, 2026-11-27).
+    fn other_vertex_input(&mut self, id: usize, col: u8, k: u8) -> Option<usize> {
         let e = &self.s.inputs[id];
-        let (name, index) = (EMULATED[usize::from(k)], e.row? * 4 + u32::from(e.col));
+        let (name, index) = (EMULATED[usize::from(k)], e.row? * 4 + u32::from(e.col + col));
         if let Some(at) = self.s.inputs.iter().position(|o| o.kind == 0 && o.name == name && o.index == index) {
             return Some(at);
         }
-        let (comp, cols) = (e.comp, e.cols);
-        let row = self.spare_input_row()?;
+        let comp = e.comp;
+        let (row, at) = self.spare_input_columns(comp, 1)?;
         self.s.inputs.push(SigElement {
             name: name.into(),
             index,
@@ -11479,12 +11484,32 @@ impl<'a> Lower<'a> {
             comp,
             interp: 1,
             row: Some(row),
-            col: 0,
-            cols,
+            col: at,
+            cols: 1,
             usage: 0,
             half: false,
         });
         Some(self.s.inputs.len() - 1)
+    }
+
+    /// Where an input of our own of `cols` constant components of type
+    /// `comp` goes ([`Self::other_vertex_input`]): behind those a register of
+    /// such inputs holds already (one type to a register), else at the start
+    /// of a spare register.
+    fn spare_input_columns(&self, comp: u8, cols: u8) -> Option<(u32, u8)> {
+        let mut ends: std::collections::BTreeMap<u32, u8> = std::collections::BTreeMap::new();
+        for e in &self.s.inputs {
+            if e.kind == 0 && (e.name == EMULATED[1] || e.name == EMULATED[2]) && e.comp == comp
+                && let Some(row) = e.row
+            {
+                let end = ends.entry(row).or_default();
+                *end = (*end).max(e.col + e.cols);
+            }
+        }
+        match ends.into_iter().find(|&(_, end)| end + cols <= 4) {
+            Some(place) => Some(place),
+            None => self.spare_input_row().map(|row| (row, 0)),
+        }
     }
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
@@ -11494,9 +11519,9 @@ impl<'a> Lower<'a> {
             // The provoking vertex's is the constant element itself; the
             // other two come in inputs of our own, constant too
             // ([`with_emulated_barycentrics`]).
-            let from = match k {
-                0 => id,
-                _ => self.other_vertex_input(id, k).ok_or("no register left for an input at a vertex")?,
+            let (from, col) = match k {
+                0 => (id, col),
+                _ => (self.other_vertex_input(id, col, k).ok_or("no register left for an input at a vertex")?, 0),
             };
             let entry = self.s.entry;
             return match self.load_any_input(from, col) {

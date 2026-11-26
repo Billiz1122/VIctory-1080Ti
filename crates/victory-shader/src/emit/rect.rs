@@ -133,7 +133,10 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement], rectangles: boo
     // The inputs a pixel shader reads in place of barycentrics, as outputs
     // after the vertex shader's, at the registers it has them.
     for x in ps_inputs.iter().filter(|e| e.kind == 0 && EMULATED.contains(&e.name.as_str())) {
-        if x.row.is_none() || x.col != 0 || outputs.iter().any(|o| o.row == x.row) {
+        // (Several of them share a register, column by column.)
+        let own = |o: &SigElement| o.kind == 0 && EMULATED.contains(&o.name.as_str());
+        let taken = |o: &SigElement| o.row == x.row && (!own(o) || (o.col < x.col + x.cols && x.col < o.col + o.cols));
+        if x.row.is_none() || outputs.iter().any(taken) {
             return Err(unsupported("a register of the pixel shader's emulated inputs is taken"));
         }
         let weights = x.name == EMULATED[0];
@@ -433,6 +436,16 @@ mod tests {
         ]
     }
 
+    /// The same of the integer TEXCOORD1 (register 2, two columns): both in
+    /// one register, as the translation packs them.
+    fn emulated_packed() -> Vec<SigElement> {
+        let second = SigElement {
+            col: 2,
+            ..element(EMULATED[2], 8, 0, 5, 6, 2)
+        };
+        vec![element(EMULATED[1], 8, 0, 5, 6, 2), second]
+    }
+
     /// The stage for a triangle's weights is a geometry shader of triangles
     /// in and three strip vertices out, with the vertex shader's outputs on
     /// both sides and the pixel shader's own inputs behind them; a
@@ -457,6 +470,21 @@ mod tests {
                 v.validate(&mut gs.clone()).unwrap();
             }
         }
+        // Two of them in one register, column by column; not over each other.
+        let gs = build(outputs(), &emulated_packed(), false).unwrap();
+        let c = Container::parse(&gs).unwrap();
+        let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let places: Vec<_> = outs[3..].iter().map(|o| (o.name.as_str(), o.row, o.col, o.cols)).collect();
+        assert_eq!(places, [("VATA", Some(6), 0, 2), ("VATB", Some(6), 2, 2)]);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut gs.clone()).unwrap();
+        }
+        let mut over = emulated_packed();
+        over[1].col = 1;
+        assert!(build(outputs(), &over, false).is_err());
         // Refused: a register of theirs that a vertex output has, an
         // element read at a vertex that the vertex shader does not write.
         let taken = [element(EMULATED[0], 0, 0, 9, 1, 3)];

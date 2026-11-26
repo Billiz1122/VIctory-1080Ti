@@ -147,7 +147,10 @@ pub(crate) fn vertex_shader_with(
     let mut all: Vec<SigElement> = outputs.to_vec();
     all.append(&mut placed);
     for x in emulated {
-        if all.iter().any(|o| o.row == x.row) || x.col != 0 {
+        // (Several of them share a register, column by column.)
+        let own = |o: &SigElement| o.kind == 0 && EMULATED.contains(&o.name.as_str());
+        let taken = |o: &SigElement| o.row == x.row && (!own(o) || (o.col < x.col + x.cols && x.col < o.col + o.cols));
+        if all.iter().any(taken) {
             return Err("a register of the pixel shader's emulated inputs is taken");
         }
         let three = s.m.i32(3);
