@@ -538,6 +538,11 @@ impl Work for Job {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
         }
+        // (Four frames for one: a frame's second present goes out between
+        // the things done here, when its half frame is over.)
+        if let Some(host) = crate::host::host() {
+            host.second_present_due();
+        }
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}

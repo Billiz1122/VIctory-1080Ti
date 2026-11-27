@@ -9163,6 +9163,11 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// A frame's second present is owed ([`Host::second_present_due`]): looked
+/// at before each thing the presenting thread does, without the presenter's
+/// lock.
+static SECOND_OWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -9177,6 +9182,17 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
+    /// Four frames for one ([`framegen::middle`]): when the title's frame,
+    /// kept at its first present, is due for its second; when the title last
+    /// presented, and the time between its presents (a slow mean, seconds).
+    second: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    interval: f64,
+    /// How long after its time a second present went out (a slow mean,
+    /// seconds): the thread that presents looks between the things it does,
+    /// which take 10 to 30 ms each in the open world. The next one is asked
+    /// for that much sooner.
+    late: f64,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9558,7 +9574,7 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         // (With frames generated between the title's, twice as many are shown.)
-        let shown = if framegen::generating() { format!(" ({:.0} shown)", fps * 2.0) } else { String::new() };
+        let shown = if framegen::generating() { format!(" ({:.0} shown)", fps * f64::from(framegen::factor())) } else { String::new() };
         let text = format!(" | VIctory {fps:.0} fps{shown} {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
@@ -9658,6 +9674,11 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
+        // (Four frames for one: the second present of the frame before, if
+        // its time has not come by now.)
+        if p.second.is_some() {
+            self.second_present(p, true);
+        }
         if planes.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
@@ -9738,7 +9759,12 @@ impl Host {
             };
             copy.reset();
             copy.keep(texture);
-            framegen::frame(&self.device, &p.swap_chain, copy, [width, height], format);
+            // Four frames for one: the title's frame is put together in a
+            // texture of ours in place of the back buffer; the frame in the
+            // middle of it and the one before goes out now, itself half a
+            // frame later ([`Host::second_present`]).
+            let kept = framegen::keeping(&self.device, [width, height], format);
+            let rests = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             let list = &copy.list;
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
@@ -9750,7 +9776,10 @@ impl Host {
                     if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
-                    pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                    match &kept {
+                        Some(k) => pre.push(transition(k, rests, D3D12_RESOURCE_STATE_RENDER_TARGET)),
+                        None => pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)),
+                    }
                     list.ResourceBarrier(&pre);
                     let compose_slot = slot.map_or(0, |i| i + 1);
                     if let Err(err) = composer.record(
@@ -9758,9 +9787,10 @@ impl Host {
                         compose_slot,
                         list,
                         [(texture, base_fmt), (over, over_fmt)],
-                        &back,
+                        kept.as_ref().unwrap_or(&back),
                         (width, height),
                     ) {
+                        framegen::unkeep();
                         copy.close();
                         drop(back);
                         drop(presenter);
@@ -9785,11 +9815,17 @@ impl Host {
                     if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
                     }
-                    post.push(transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ));
+                    match &kept {
+                        Some(k) => {
+                            post.push(transition(k, D3D12_RESOURCE_STATE_RENDER_TARGET, rests));
+                            post.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
+                        }
+                        None => post.push(transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )),
+                    }
                     list.ResourceBarrier(&post);
                     true
                 } else {
@@ -9808,8 +9844,32 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
+                if let Some(k) = &kept {
+                    pre.push(transition(k, rests, D3D12_RESOURCE_STATE_COPY_DEST));
+                }
                 list.ResourceBarrier(&pre);
-                list.CopyResource(&back, texture);
+                match &kept {
+                    Some(k) => {
+                        list.CopyResource(k, texture);
+                        list.ResourceBarrier(&[transition(k, D3D12_RESOURCE_STATE_COPY_DEST, rests)]);
+                    }
+                    None => list.CopyResource(&back, texture),
+                }
+            }
+            // (The back buffer is a copy destination here; a kept frame is in
+            // its texture.) The frame in the middle, or the kept one where
+            // none was generated, goes into the back buffer.
+            let middle = if kept.is_some() { framegen::middle(copy, [width, height], format) } else { None };
+            let part = if middle.is_some() { framegen::Part::First } else { framegen::Part::Whole };
+            framegen::frame(&self.device, &p.swap_chain, copy, [width, height], format, part);
+            if let Some(k) = &kept {
+                let (from, at) = match &middle {
+                    Some(m) => (m, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    None => (k, rests),
+                };
+                list.ResourceBarrier(&[transition(from, at, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyResource(&back, from);
+                list.ResourceBarrier(&[transition(from, D3D12_RESOURCE_STATE_COPY_SOURCE, at)]);
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -9892,6 +9952,19 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // Four frames for one: the title's own frame is due half of the
+            // time between its presents from now.
+            let now = std::time::Instant::now();
+            if let Some(last) = p.last {
+                let took = now.duration_since(last).as_secs_f64();
+                p.interval = if p.interval == 0.0 { took } else { p.interval * 0.8 + took * 0.2 };
+            }
+            p.last = Some(now);
+            // (Sooner by what the last ones were late, but not before a
+            // sixth of the frame.)
+            let half = (p.interval / 2.0 - p.late).max(p.interval / 6.0).clamp(0.004, 0.25);
+            p.second = middle.is_some().then(|| now + std::time::Duration::from_secs_f64(half));
+            SECOND_OWED.store(p.second.is_some(), Ordering::Relaxed);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -9904,6 +9977,90 @@ impl Host {
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
+        }
+    }
+
+    /// Four frames for one ([`framegen::middle`]): the second present of the
+    /// title's last frame, if its time has come. Asked by the thread that
+    /// presents, before each thing it does.
+    pub(crate) fn second_present_due(&self) {
+        if !SECOND_OWED.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = presenter.as_mut()
+            && p.second.is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            self.second_present(p, false);
+        }
+    }
+
+    /// The title's frame, kept at its first present (where the frame in the
+    /// middle went out in its place), goes into the back buffer and is
+    /// presented: the swap chain generates a frame before it as before any.
+    fn second_present(&self, p: &mut Presenter, late: bool) {
+        if let Some(due) = p.second.take() {
+            let by = std::time::Instant::now().saturating_duration_since(due).as_secs_f64().min(p.interval / 2.0);
+            p.late = p.late * 0.8 + by * 0.2;
+        }
+        SECOND_OWED.store(false, Ordering::Relaxed);
+        if let Some(first) = p.last {
+            framegen::second_went(first.elapsed(), late);
+        }
+        let Some(kept) = framegen::kept() else {
+            return;
+        };
+        // SAFETY: a live texture.
+        let d = unsafe { kept.GetDesc() };
+        if (d.Width, d.Height) != (u64::from(p.width), p.height) {
+            return;
+        }
+        // SAFETY: our swap chain, a list of ours that is not in the air, and
+        // our texture, which rests readable by shaders.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
+                return;
+            };
+            // As the first present's list: sent ahead, or run and waited for.
+            let slot = if late_free_present() {
+                let finished = FINISHED.load(Ordering::Acquire);
+                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                    let list = self.new_list().ok()?;
+                    list.close();
+                    p.ahead.push((list, 0));
+                    Some(p.ahead.len() - 1)
+                })
+            } else {
+                None
+            };
+            let copy = match slot {
+                Some(i) => &p.ahead[i].0,
+                None => &p.copy,
+            };
+            copy.reset();
+            copy.keep(&kept);
+            framegen::frame(&self.device, &p.swap_chain, copy, [p.width, p.height], p.format, framegen::Part::Second);
+            let list = &copy.list;
+            let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            list.ResourceBarrier(&[
+                transition(&kept, read, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+            ]);
+            list.CopyResource(&back, &kept);
+            list.ResourceBarrier(&[
+                transition(&kept, D3D12_RESOURCE_STATE_COPY_SOURCE, read),
+                transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            ]);
+            copy.close();
+            match slot {
+                Some(i) => {
+                    let flown = self.execute_own(copy);
+                    p.ahead[i].1 = flown;
+                }
+                None => self.execute(&[copy]),
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
         }
     }
 
@@ -9956,6 +10113,10 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                second: None,
+                last: None,
+                interval: 0.0,
+                late: 0.0,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
