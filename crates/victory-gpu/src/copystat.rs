@@ -1013,10 +1013,13 @@ fn log_memory() {
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
+         reset since they were made: {}; lists of ours for written-down recordings: {} made, {} \
+         of them idle",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+        crate::list::thin::backs().0,
+        crate::list::thin::backs().1,
     );
     if memory_categories() {
         let fields: &[(&str, u64)] = &[

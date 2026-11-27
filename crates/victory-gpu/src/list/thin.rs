@@ -64,6 +64,8 @@ pub(crate) fn wanted() -> bool {
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
     words: Vec<u64>,
+    /// Words of this recording were handed over.
+    handed: bool,
     closed: bool,
     submitted: bool,
 }
@@ -90,6 +92,7 @@ impl Front {
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
         self.recording = Some(Arc::new(Recording::new(kind)));
+        self.handed = false;
         self.closed = false;
         self.submitted = false;
         self.put(RESET, &[pipeline as u64]);
@@ -137,6 +140,7 @@ impl Front {
         }
         let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
+        self.handed = true;
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
             let mut inner = held(&recording.inner);
@@ -153,9 +157,19 @@ impl Front {
         if self.closed {
             return;
         }
+        // Nothing but the reset was recorded: a list the title made, or
+        // reset, and closed to keep for later. Its words wait for a
+        // submission ([`submitted`]), which hardly ever comes: translated
+        // now they took a list of ours, with a host list and its allocator
+        // (1.8 MB of the driver's memory), kept until the title's next
+        // reset of the list; in gameplay 2,000 host lists were alive where
+        // a frame records 210.
+        let parked = !self.handed && self.words.len() == 2;
         self.put(CLOSE, &[]);
         self.closed = true;
-        self.hand_over();
+        if !parked {
+            self.hand_over();
+        }
     }
 }
 
@@ -166,6 +180,14 @@ static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Lists of ours made so far.
+static BACKS_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// For the memory line: the lists of ours made so far, and those nobody uses.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn backs() -> (u64, usize) {
+    (BACKS_MADE.load(Relaxed), held(&BACKS).len())
+}
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -226,6 +248,19 @@ impl Recording {
     /// The list of ours it went to (null: it was never begun).
     pub(crate) fn back(&self) -> This {
         held(&self.inner).back as This
+    }
+
+    /// Gives its list of ours to the next recording: a submission has taken
+    /// that list's host side (`crate::list::detach`), and nothing of this
+    /// recording is in it any more. A recording kept it until the title
+    /// reset its list: every list the title ever recorded held one of ours,
+    /// and that a host list with its allocator (1.8 MB of the driver's
+    /// memory each; 2,100 alive in gameplay, where a frame records 210).
+    pub(crate) fn release_back(&self) {
+        let back = std::mem::take(&mut held(&self.inner).back);
+        if back != 0 {
+            held(&BACKS).push(back);
+        }
     }
 
     /// Translates what there is.
@@ -294,6 +329,7 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
+    BACKS_MADE.fetch_add(1, Relaxed);
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
@@ -337,6 +373,8 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
             // SAFETY: the title passes its lists, which nobody records into now.
             let front = unsafe { &mut (*l.cast_mut().cast::<List>()).thin };
             front.close();
+            // (What a list closed with nothing recorded kept back.)
+            front.hand_over();
             front.submitted = true;
             front.recording.clone()
         })

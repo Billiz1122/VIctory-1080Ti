@@ -432,6 +432,7 @@ impl Work for Job {
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
         let jobs = jobs_of(queue as This, &lists);
+        recordings.iter().for_each(|r| r.release_back());
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
