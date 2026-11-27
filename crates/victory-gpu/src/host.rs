@@ -6761,15 +6761,27 @@ impl HostList {
         // SAFETY: a closed list of ours and its allocator; the commands
         // recorded stay unused in the allocator's memory until its reset.
         let emptied = unsafe { self.list.Reset(&self.allocator, None).and_then(|()| self.list.Close()) };
+        // What the PC's memory was like: the one time this happened (trial
+        // v2-bary) Windows was making its page file larger, the PC's memory
+        // 3.2 GB short of full; a later time says whether that is its cause.
+        let memory = ram_sample().map_or_else(String::new, |(working, private, free, left, ..)| {
+            format!(
+                "; this process had {} MB in memory and {} MB committed, the PC {} MB free and {} MB left to commit",
+                working >> 20,
+                private >> 20,
+                free >> 20,
+                left >> 20
+            )
+        });
         if debug || emptied.is_err() || (n > MOST && !testing) {
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
+                "a host command list did not close ({e}): a command recorded into it was invalid{memory}"
             ));
         }
         tracing::error!(
             error = %e,
             lists = n,
-            "a host command list did not close: it runs empty, and its part of this frame is missing"
+            "a host command list did not close: it runs empty, and its part of this frame is missing{memory}"
         );
     }
 
