@@ -5393,6 +5393,10 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
 /// with a length in the same cell makes the whole cell's window, and the
 /// tail is that.
+/// On a GTX 1080 Ti (2026-11-27) with `VICTORY_WINDOW_KB=1024`: 0.5 GB
+/// less in the prologue's cell (2,322 windows 3.3 GB, where 856 held 3.9),
+/// but the one play session of 20 minutes lost the device (0x887A0006)
+/// after 584 s, windows going every second; without the two it ran through.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
