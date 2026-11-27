@@ -161,6 +161,10 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// kept free for others) is under 88 % of its budget, else enough to come
 /// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
+/// (With textures made up to 82 % only, `VICTORY_TEXTURE_ROOM_PERCENT`,
+/// none of the two upper bands is ever reached. Moving the bands with that
+/// line, 80/87/77 %, lost the device on a GTX 1080 Ti after 380 s, textures
+/// idle for 5 s going all the time (trial tex3, 2026-11-27): left as it is.)
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
