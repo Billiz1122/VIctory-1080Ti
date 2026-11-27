@@ -31,6 +31,35 @@ pub fn host_texture(
     Some((texture, state))
 }
 
+pub use crate::host::framegen::Values as FrameValues;
+
+/// The title made its upscaler, with these flags and this largest render
+/// size: what frames generated between the title's go by
+/// (`crate::host::framegen`).
+pub fn upscaler(flags: u32, max_render: [u32; 2]) {
+    crate::host::framegen::upscaler(flags, max_render);
+}
+
+/// A frame's depth and motion vectors at the upscaling's place in the title
+/// list `list`: host textures ([`host_texture`]) in the host states given,
+/// with the upscaler's descriptions of the two and the values they are read
+/// with. Copied there for the frames generated between the title's; nothing
+/// without them.
+pub fn frame_inputs(
+    list: *const Object,
+    depth: (&ID3D12Resource, u32),
+    motion: (&ID3D12Resource, u32),
+    descriptions: [[u32; 8]; 2],
+    values: FrameValues,
+) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    crate::list::with_state(list, |host_list, _| {
+        crate::host::framegen::inputs(&host.device, host_list, depth, motion, descriptions, values);
+    });
+}
+
 /// Runs `f` with the list that records the commands of the title list `list`
 /// (open for recording), in order with them: `list` itself, now; or, while
 /// list calls are written down and translated by threads of ours

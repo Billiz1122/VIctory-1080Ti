@@ -344,6 +344,7 @@ extern "C" fn ffxCreateContext(
         flags = format_args!("{:#x}", upscale.flags),
         "FidelityFX: upscaler context on the host"
     );
+    victory_gpu::external::upscaler(upscale.flags, upscale.max_render);
     OK
 }
 
@@ -434,11 +435,16 @@ impl Upscaling {
     fn run(mut self, host: &Host, list: *const Object) {
         // Alive for the call (the list holds them too).
         let mut textures = Vec::new();
-        for r in self
+        // The depth and the motion vectors (the second and third resource),
+        // with the host states they are in.
+        let mut inputs = [None, None];
+        let descriptions = [self.dispatch.resources[1].description, self.dispatch.resources[2].description];
+        for (at, r) in self
             .dispatch
             .resources
             .iter_mut()
-            .filter(|r| !r.resource.is_null())
+            .enumerate()
+            .filter(|(_, r)| !r.resource.is_null())
         {
             let wanted = host_state(r.state);
             let texture = wanted.and_then(|w| {
@@ -454,6 +460,9 @@ impl Upscaling {
                 return;
             };
             r.resource = texture.as_raw();
+            if let (1 | 2, Some(state)) = (at, wanted) {
+                inputs[at - 1] = Some((texture.clone(), state));
+            }
             textures.push(texture);
         }
         once!(info, formats = ?textures.iter().map(|t| {
@@ -467,6 +476,23 @@ impl Upscaling {
         });
         if code != Some(OK) {
             once!(warn, code = ?code, "FidelityFX: the host's upscaling failed");
+        }
+        // For the frames generated between the title's, if any are.
+        if let [Some((depth, depth_state)), Some((motion, motion_state))] = &inputs {
+            let rest = &self.dispatch.rest;
+            let float = |i: usize| f32::from_bits(rest[i]);
+            let values = victory_gpu::external::FrameValues {
+                render: [rest[4], rest[5]],
+                jitter: [float(0), float(1)],
+                motion_scale: [float(2), float(3)],
+                frame_time: float(10),
+                reset: rest[12] & 0xff != 0,
+                near: float(13),
+                far: float(14),
+                fov: float(15),
+                to_meters: float(16),
+            };
+            victory_gpu::external::frame_inputs(list, (depth, *depth_state), (motion, *motion_state), descriptions, values);
         }
     }
 }

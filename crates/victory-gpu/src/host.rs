@@ -4025,6 +4025,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod framegen;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -9514,7 +9515,9 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // (With frames generated between the title's, twice as many are shown.)
+        let shown = if framegen::generating() { format!(" ({:.0} shown)", fps * 2.0) } else { String::new() };
+        let text = format!(" | VIctory {fps:.0} fps{shown} {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9693,6 +9696,7 @@ impl Host {
             };
             copy.reset();
             copy.keep(texture);
+            framegen::frame(&self.device, &p.swap_chain, copy, [width, height], format);
             let list = &copy.list;
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
@@ -9888,9 +9892,14 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            // With frames generated between the title's ([`framegen`]), the
+            // library that generates them makes it.
+            let swap_chain = match framegen::swap_chain(&factory, &self.queue, hwnd, &desc) {
+                Some(chain) => chain,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
