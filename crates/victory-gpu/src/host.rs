@@ -9522,7 +9522,10 @@ impl Meter {
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                     raw views kept inside their buffer (past its end, shortened, under a dword, unaligned) since the start: SRV {raw_srv:?}, UAV {raw_uav:?}",
+                    raw_srv = crate::descriptor::host::raw_view_counts()[0],
+                    raw_uav = crate::descriptor::host::raw_view_counts()[1],
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
