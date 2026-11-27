@@ -154,6 +154,33 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// The least a texture must have been idle to go where the card is fuller
+/// ([`vram_keep`]'s 5 s and 1.5 s): `VICTORY_TEXTURE_IDLE_LEAST_MS`, 0 unless
+/// set. On a GTX 1080 Ti textures going after 5 s all the time lost the
+/// device within 380 s (trial tex3); after a minute they did not.
+fn idle_least_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_IDLE_LEAST_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |ms| ms.min(600_000))
+    })
+}
+
+/// How long an idle texture stays while the card has room ([`vram_keep`]):
+/// ten minutes, or `VICTORY_TEXTURE_KEPT_MS` (10,000 to 600,000). Where new
+/// textures stop under 88 % of the budget (`VICTORY_TEXTURE_ROOM_PERCENT`,
+/// 82 on a GTX 1080 Ti) this is the only way one goes: for ten minutes after
+/// a change of place the card held the place before and refused the new
+/// one's textures (4.4 GB held, 12,900 waiting: surfaces white).
+fn kept_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_KEPT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(600_000, |ms| ms.clamp(10_000, 600_000))
+    })
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -170,7 +197,6 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
-    const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
@@ -178,11 +204,11 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
     let share = |percent: u64| budget / 100 * percent;
     if used < share(88) {
-        (KEPT_MS, u64::MAX)
+        (kept_ms(), u64::MAX)
     } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+        (IDLE_MS.max(idle_least_ms()), used - share(85))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS.max(idle_least_ms()), used - share(85))
     }
 }
 
