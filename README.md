@@ -1,3 +1,68 @@
+# VIctory on a GTX 1080 Ti
+
+This branch ports [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(at `0dec5dc`) to a card without mesh shaders. The rest of this README, from
+"VIctory on an RX 7900 XTX" down, is that tree's own.
+
+## What runs here
+
+Tested on one PC only: Windows 10, NVIDIA GTX 1080 Ti (11 GB, no mesh shaders, no
+barycentrics, 32-lane waves), Ryzen 5 2600X, 32 GB of RAM, the Series S profile.
+
+| | |
+|---|---|
+| Stability | sessions of 20 minutes from the title screen into the open world, no failure |
+| The title's own frame rate | 11-14 fps in the prologue's cell, 8-11 in the open world (the processor is the limit) |
+| Frames shown | 35-44 a second with four frames for one (`VICTORY_FRAME_GENERATION=4`), 18-28 with two |
+| Memory | 20-26 GB of the PC's, 9.5 of the card's 10 GB budget |
+
+What this branch adds:
+
+- **Mesh shaders run as compute shaders** where the card has none, with their
+  draws grouped; barycentrics emulated, in mesh pipelines and, through a
+  geometry stage, behind the title's own vertex shaders (hair, particles).
+- **Frame generation** with AMD FidelityFX (`VICTORY_FRAME_GENERATION=1`: two
+  frames for each of the title's; `=4`: four, the library used twice over).
+- **Textures:** how long idle ones stay on the card (`VICTORY_TEXTURE_KEPT_MS`),
+  and the room kept for render targets sized for 720p
+  (`VICTORY_CARD_ROOM_FOR_TARGETS_MB`).
+- **Light** in rooms the title lights with rays: a least level for the stand-in
+  (`VICTORY_AMBIENT_LEAST`).
+- **Keyboard and mouse** as in GTA V on PC (`VICTORY_KBM_GTA=1`, from
+  [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+  pull request 295: F2 holds the mouse for the camera).
+- Fewer host command lists, reused copy buffers, helper threads above normal
+  priority, and a list that fails to close runs empty instead of ending the run.
+
+Settings used (environment variables), with `victory run <exe> --execute --console series-s`:
+
+```
+VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_RELAY=2
+VICTORY_WIDE_BACK=1 VICTORY_RELAY_COPY=1 VICTORY_JOIN_COPIES=1
+VICTORY_CARD_REHASH_RUNS=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_INDIRECT_BATCH=2
+VICTORY_CARD_STEPS=2 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MAP_THREADS=1
+VICTORY_TITLE_PRIORITIES=0 VICTORY_SHOW_AFTER=1 VICTORY_CHAIN_ABOVE=1
+VICTORY_SNAPSHOT_POOL=64 VICTORY_MEMORY_MAP=0 VICTORY_LEVELS_ON_DEMAND=1
+VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536
+VICTORY_OUTPUT=1280x720 VICTORY_WINDOW_MAX=640x360
+VICTORY_TEXTURE_ROOM_PERCENT=82 VICTORY_CARD_ROOM_FOR_TARGETS_MB=2300
+VICTORY_TEXTURE_KEPT_MS=60000 VICTORY_AMBIENT=3 VICTORY_AMBIENT_LEAST=0.6
+VICTORY_AMBIENT_AIR=1.5 VICTORY_FRAME_GENERATION=4 VICTORY_KBM_GTA=1
+VICTORY_FIDELITYFX_DIR=<folder with AMD's DLLs>
+VICTORY_SKIP_PIPELINES=<the first column of scripts/gtx1080-skip.txt, comma-separated>
+```
+
+`VICTORY_FIDELITYFX_DIR` holds `amd_fidelityfx_upscaler_dx12.dll` and
+`amd_fidelityfx_framegeneration_dx12.dll` from
+[AMD's FidelityFX SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+(not included). Without the upscaler the Series S world is black here.
+
+Still wrong: the title's own frame rate is far from 30; frame generation smears
+what moves fast and subtitles when their text changes, and what the game
+answers to is no sooner; not all of the open world's textures fit the card;
+night scenes are dark; one "host command list did not close" was seen once and
+not explained (the run goes on without that list's part of the frame).
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
